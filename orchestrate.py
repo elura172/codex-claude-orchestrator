@@ -6,15 +6,29 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 
 
-def run(cmd: list[str], *, cwd: Path, stdin: str | None = None, stream: bool = False) -> str:
+class StageTimeoutError(RuntimeError):
+    pass
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    stdin: str | None = None,
+    stream: bool = False,
+    timeout: float | None = None,
+) -> str:
     if stream:
         # Tee stdout to the console while collecting it; stderr inherits the
         # terminal so warnings appear live. Writing stdin up front is safe
@@ -25,25 +39,59 @@ def run(cmd: list[str], *, cwd: Path, stdin: str | None = None, stream: bool = F
             stdin=subprocess.PIPE if stdin is not None else None,
             stdout=subprocess.PIPE,
             text=True,
+            start_new_session=timeout is not None,
         )
-        if stdin is not None:
-            process.stdin.write(stdin)
-            process.stdin.close()
-        lines = []
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            lines.append(line)
-        if process.wait():
+        timed_out = threading.Event()
+        timeout_lock = threading.Lock()
+
+        def terminate() -> None:
+            with timeout_lock:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        timed_out.set()
+                    except ProcessLookupError:
+                        pass
+
+        timer = threading.Timer(timeout, terminate) if timeout is not None else None
+        if timer:
+            timer.daemon = True
+            timer.start()
+        try:
+            if stdin is not None:
+                try:
+                    process.stdin.write(stdin)
+                    process.stdin.close()
+                except BrokenPipeError:
+                    if not timed_out.is_set():
+                        raise
+            lines = []
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                lines.append(line)
+            process.wait()
+        finally:
+            if timer:
+                timer.cancel()
+        with timeout_lock:
+            did_time_out = timed_out.is_set()
+        if did_time_out:
+            raise TimeoutError
+        if process.returncode:
             raise RuntimeError(f"Command failed ({process.returncode}): {shlex.join(cmd)}")
         return "".join(lines)
-    result = subprocess.run(
-        cmd,
-        cwd=cwd,
-        input=stdin,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            input=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError from None
     if result.returncode:
         detail = (result.stderr or result.stdout or "no output").strip()
         raise RuntimeError(f"Command failed ({result.returncode}): {shlex.join(cmd)}\n{detail}")
@@ -85,6 +133,7 @@ def invoke(
     repo: Path,
     dry_run: bool,
     prompt_flag: str | None = None,
+    timeout: float | None = None,
 ) -> None:
     print(f"\n==> {name}")
     write(output.with_suffix(output.suffix + ".prompt.md"), prompt)
@@ -92,10 +141,13 @@ def invoke(
         print(shlex.join(cmd))
         write(output, f"DRY RUN: {shlex.join(cmd)}")
         return
-    if prompt_flag:
-        result = run(cmd + [prompt_flag, prompt], cwd=repo, stream=True)
-    else:
-        result = run(cmd, cwd=repo, stdin=prompt, stream=True)
+    try:
+        if prompt_flag:
+            result = run(cmd + [prompt_flag, prompt], cwd=repo, stream=True, timeout=timeout)
+        else:
+            result = run(cmd, cwd=repo, stdin=prompt, stream=True, timeout=timeout)
+    except TimeoutError:
+        raise StageTimeoutError(f"Stage timed out after {timeout:g} seconds: {name}") from None
     # Codex writes its final message itself; Claude prints to stdout.
     if not output.exists():
         write(output, result)
@@ -115,10 +167,17 @@ def parse_args() -> argparse.Namespace:
                         help="Add an independent second review from the Hermes agent (tools disabled)")
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
+    parser.add_argument("--stage-timeout-seconds", type=float,
+                        help="Wall-clock timeout for each agent invocation (default: none)")
     parser.add_argument("--allow-dirty", action="store_true", help="Run despite existing changes")
     parser.add_argument("--skip-review-fix", action="store_true", help="Stop after Claude's review")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and prompts only")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.stage_timeout_seconds is not None and (
+        not math.isfinite(args.stage_timeout_seconds) or args.stage_timeout_seconds <= 0
+    ):
+        parser.error("--stage-timeout-seconds must be greater than zero")
+    return args
 
 
 def main() -> int:
@@ -185,6 +244,7 @@ def main() -> int:
         plan,
         repo,
         args.dry_run,
+        timeout=args.stage_timeout_seconds,
     )
 
     codex_cmd = [
@@ -200,6 +260,7 @@ def main() -> int:
         codex_result,
         repo,
         args.dry_run,
+        timeout=args.stage_timeout_seconds,
     )
 
     invoke(
@@ -209,6 +270,7 @@ def main() -> int:
         review,
         repo,
         args.dry_run,
+        timeout=args.stage_timeout_seconds,
     )
 
     reviews = [review]
@@ -229,6 +291,7 @@ def main() -> int:
             repo,
             args.dry_run,
             prompt_flag="-z",
+            timeout=args.stage_timeout_seconds,
         )
         reviews.append(mirai_review)
 
@@ -245,6 +308,7 @@ def main() -> int:
                 fix_result,
                 repo,
                 args.dry_run,
+                timeout=args.stage_timeout_seconds,
             )
 
     if not args.dry_run:

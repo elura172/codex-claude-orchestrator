@@ -40,9 +40,12 @@ Useful options:
 --hermes
 --hermes-model MODEL
 --max-budget-usd AMOUNT
+--stage-timeout-seconds SECONDS
 --skip-review-fix
 --allow-dirty
 ```
+
+`--stage-timeout-seconds` applies a wall-clock timeout to each agent invocation. By default, agent invocations have no timeout.
 
 Each run is preserved under the target repository's private Git directory at `.git/agent-collab/runs/<timestamp>/`, including prompts, responses, final status, and a final patch. The patch includes both tracked changes and non-ignored untracked files. Because artifacts live under `.git`, they do not pollute the working tree.
 
