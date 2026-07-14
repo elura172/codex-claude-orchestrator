@@ -66,10 +66,13 @@ def run(
                     if not timed_out.is_set():
                         raise
             lines = []
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                lines.append(line)
-            process.wait()
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    lines.append(line)
+            finally:
+                process.stdout.close()
+                process.wait()
         finally:
             if timer:
                 timer.cancel()
@@ -142,6 +145,72 @@ def complete_diff(repo: Path, baseline: str) -> str:
     return "\n".join(chunk.rstrip() for chunk in chunks if chunk).rstrip()
 
 
+def list_mir_nodes(skills_dir: Path) -> list[str]:
+    if not skills_dir.is_dir():
+        return []
+    return sorted(
+        path.name for path in skills_dir.iterdir() if (path / "SKILL.md").is_file()
+    )
+
+
+def resolve_mir_skill(skills_dir: Path, node: str) -> Path:
+    available_nodes = list_mir_nodes(skills_dir)
+    skill_file = skills_dir / node / "SKILL.md"
+    if node in available_nodes:
+        return skill_file
+    available = ", ".join(available_nodes) or "(none found)"
+    raise RuntimeError(
+        f"Unknown mirror node {node!r} — no SKILL.md at {skills_dir / node}. "
+        f"Available nodes in {skills_dir}: {available}"
+    )
+
+
+def mirror_review_enabled(
+    hermes: bool, mir_node: str | None, mir_backend: str | None
+) -> bool:
+    return hermes or mir_node is not None or mir_backend is not None
+
+
+def mirror_review_invocation(
+    backend: str,
+    *,
+    repo: Path,
+    output: Path,
+    node: str | None = None,
+    hermes_model: str | None = None,
+    claude_model: str | None = None,
+    codex_model: str | None = None,
+    max_budget_usd: float | None = None,
+) -> tuple[list[str], str | None, bool]:
+    """Build the command, prompt flag, and JSON setting for a mirror reviewer."""
+    if backend == "hermes":
+        cmd = ["hermes", "-t", ""]
+        if node:
+            cmd += ["--skills", node]
+        if hermes_model:
+            cmd += ["-m", hermes_model]
+        return cmd, "-z", False
+    if backend == "claude":
+        cmd = [
+            "claude", "--print", "--no-session-persistence", "--permission-mode", "plan",
+            "--tools", "", "--output-format", "json",
+        ]
+        if claude_model:
+            cmd += ["--model", claude_model]
+        if max_budget_usd is not None:
+            cmd += ["--max-budget-usd", str(max_budget_usd)]
+        return cmd, None, True
+    if backend == "codex":
+        cmd = [
+            "codex", "exec", "-C", str(repo), "--sandbox", "read-only",
+            "--color", "never", "--output-last-message", str(output), "-",
+        ]
+        if codex_model:
+            cmd[2:2] = ["--model", codex_model]
+        return cmd, None, False
+    raise ValueError(f"Unsupported mirror backend: {backend}")
+
+
 def invoke(
     name: str,
     cmd: list[str],
@@ -160,8 +229,9 @@ def invoke(
         write(output, f"DRY RUN: {shlex.join(cmd)}")
         return None
     try:
-        if prompt_flag:
-            result = run(cmd + [prompt_flag, prompt], cwd=repo, stream=True, timeout=timeout)
+        if prompt_flag is not None:
+            prompt_args = [prompt] if prompt_flag == "" else [prompt_flag, prompt]
+            result = run(cmd + prompt_args, cwd=repo, stream=True, timeout=timeout)
         else:
             result = run(cmd, cwd=repo, stdin=prompt, stream=True, timeout=timeout)
     except TimeoutError:
@@ -188,6 +258,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hermes", action="store_true",
                         help="Add an independent second review from the Hermes agent (tools disabled)")
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
+    parser.add_argument(
+        "--mir",
+        help=("Mirror-node lens for the independent second review "
+              "(a subdirectory of --mir-skills-dir containing SKILL.md)"),
+    )
+    parser.add_argument(
+        "--mir-backend",
+        choices=["hermes", "claude", "codex"],
+        default=None,
+        help=("Backend for the independent second review (default: hermes); "
+              "passing this option enables the review"),
+    )
+    parser.add_argument(
+        "--mir-skills-dir",
+        type=Path,
+        default=Path("~/.hermes/skills/mirror-nodes"),
+        help="Directory of mirror-node skill folders, each containing SKILL.md",
+    )
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
@@ -204,7 +292,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    executables = ["git", "codex", "claude"] + (["hermes"] if args.hermes else [])
+    mir_backend = args.mir_backend or "hermes"
+    mir_enabled = mirror_review_enabled(args.hermes, args.mir, args.mir_backend)
+    mir_skills_dir = args.mir_skills_dir.expanduser().resolve()
+    mir_skill_text = None
+    if args.mir is not None:
+        mir_skill_file = resolve_mir_skill(mir_skills_dir, args.mir)
+        if mir_backend != "hermes":
+            mir_skill_text = mir_skill_file.read_text(encoding="utf-8")
+
+    executables = ["git", "codex", "claude"]
+    if mir_enabled and mir_backend == "hermes":
+        executables.append("hermes")
     for executable in executables:
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable not found: {executable}")
@@ -240,6 +339,10 @@ def main() -> int:
         "repo": str(repo),
         "baseline": baseline,
         "hermes": args.hermes,
+        "mir_enabled": mir_enabled,
+        "mir_node": args.mir,
+        "mir_backend": mir_backend if mir_enabled else None,
+        "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
     }
@@ -253,7 +356,7 @@ def main() -> int:
     plan = artifacts / "01-plan.md"
     codex_result = artifacts / "02-implementation.md"
     review = artifacts / "03-review.md"
-    mirai_review = artifacts / "03b-mirai-review.md"
+    mir_review = artifacts / "03b-mir-review.md"
     fix_result = artifacts / "04-fixes.md"
 
     claude_base = [
@@ -307,27 +410,40 @@ def main() -> int:
     record_usage("Claude: review", usage)
 
     reviews = [review]
-    if args.hermes:
-        # Hermes reviews independently (it never sees Claude's review) and has
-        # all toolsets disabled, so the diff travels inside the prompt.
+    if mir_enabled:
+        # The mirror reviewer never sees Claude's review or uses repository
+        # tools, so every backend receives the diff inside its prompt.
         diff_text = complete_diff(repo, baseline)
         if len(diff_text) > 120_000:
             diff_text = diff_text[:120_000] + "\n[diff truncated for length]"
-        hermes_cmd = ["hermes", "-t", ""]
-        if args.hermes_model:
-            hermes_cmd += ["-m", args.hermes_model]
+        skill_prefix = f"{mir_skill_text}\n\n---\n\n" if mir_skill_text else ""
+        mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
+        stage_label = f"Mir ({mir_backend}): independent review"
+
+        mir_cmd, prompt_flag, parse_json = mirror_review_invocation(
+            mir_backend,
+            repo=repo,
+            output=mir_review,
+            node=args.mir,
+            hermes_model=args.hermes_model,
+            claude_model=args.claude_model,
+            codex_model=args.codex_model,
+            max_budget_usd=args.max_budget_usd,
+        )
+
         usage = invoke(
-            "Hermes: independent review",
-            hermes_cmd,
-            f"""Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}""",
-            mirai_review,
+            stage_label,
+            mir_cmd,
+            mir_prompt,
+            mir_review,
             repo,
             args.dry_run,
-            prompt_flag="-z",
+            prompt_flag=prompt_flag,
             timeout=args.stage_timeout_seconds,
+            parse_json=parse_json,
         )
-        record_usage("Hermes: independent review", usage)
-        reviews.append(mirai_review)
+        record_usage("Mir: independent review", usage)
+        reviews.append(mir_review)
 
     if not args.skip_review_fix:
         texts = [] if args.dry_run else [p.read_text(encoding="utf-8") for p in reviews]
