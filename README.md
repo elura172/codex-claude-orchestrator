@@ -18,7 +18,7 @@ It does not commit, push, merge, bypass permissions, or discard changes. By defa
 ## Usage
 
 ```bash
-python3 /Users/mirrr/codex-claude-orchestrator/orchestrate.py \
+python3 orchestrate.py \
   --repo /path/to/project \
   "Add rate limiting to the password-reset endpoint with regression tests"
 ```
@@ -26,7 +26,7 @@ python3 /Users/mirrr/codex-claude-orchestrator/orchestrate.py \
 Preview the commands and generated prompts without invoking either agent:
 
 ```bash
-python3 /Users/mirrr/codex-claude-orchestrator/orchestrate.py \
+python3 orchestrate.py \
   --repo /path/to/project \
   --dry-run \
   "Describe the task"
