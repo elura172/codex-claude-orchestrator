@@ -52,9 +52,11 @@ Useful options:
 
 `--mir NODE` applies a mirror-node lens from `<mir-skills-dir>/<NODE>/SKILL.md`; the skills directory defaults to `~/.hermes/skills/mirror-nodes`. The mirror backend defaults to Hermes. Supplying `--mir` or `--mir-backend` enables the independent review without `--hermes`; `--hermes` remains available for backward compatibility. Hermes receives the node name through its native `--skills` option after the configured directory is used for pre-flight validation; Hermes itself resolves that name using its own skill configuration. Claude and Codex instead receive the validated skill file's text at the start of their review prompt.
 
+After all stages finish, the orchestrator prints a plain-text summary of each executed stage's wall-clock duration and recorded cost, plus totals. The same text is saved as `summary.txt` in the run's artifacts directory.
+
 Each run is preserved under the target repository's private Git directory at `.git/agent-collab/runs/<timestamp>/`, including prompts, responses, final status, and a final patch. The patch includes both tracked changes and non-ignored untracked files. Because artifacts live under `.git`, they do not pollute the working tree.
 
-`run.json` records whether the mirror review was enabled and its chosen node, backend, and skills directory. It also records Claude's reported cost, token counts, and turn count under `usage`, keyed by stage name. Codex and Hermes stages are recorded as `null`; malformed Claude JSON also falls back to plain-text output with `null` usage.
+`run.json` records whether the mirror review was enabled and its chosen node, backend, and skills directory. It also records Claude's reported cost, token counts, and turn count under `usage`, plus wall-clock seconds under `durations`, keyed by the same stage names. Codex and Hermes stages are recorded as `null` under `usage`; malformed Claude JSON also falls back to plain-text output with `null` usage.
 
 ## Safety model
 

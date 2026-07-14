@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 
 class StageTimeoutError(RuntimeError):
@@ -124,6 +125,48 @@ def extract_result_and_usage(stdout: str) -> tuple[str, dict | None]:
         }
     except (json.JSONDecodeError, KeyError, TypeError):
         return stdout, None
+
+
+def format_duration(seconds: float) -> str:
+    """Render elapsed seconds as M:SS, or H:MM:SS once it reaches an hour."""
+    total = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def build_summary(durations: dict[str, float], usage: dict[str, dict | None]) -> str:
+    """Render a plain-text, aligned per-stage duration/cost table with a total row."""
+    if not durations:
+        return "No stages executed."
+    rows = []
+    total_seconds = 0.0
+    total_cost = 0.0
+    have_cost = False
+    for name, seconds in durations.items():
+        total_seconds += seconds
+        cost = (usage.get(name) or {}).get("total_cost_usd")
+        cost_text = ""
+        if isinstance(cost, (int, float)):
+            total_cost += cost
+            have_cost = True
+            cost_text = f"${cost:.4f}"
+        rows.append((name, format_duration(seconds), cost_text))
+    rows.append((
+        "Total",
+        format_duration(total_seconds),
+        f"${total_cost:.4f}" if have_cost else "",
+    ))
+    name_width = max(len(row[0]) for row in rows)
+    duration_width = max(len(row[1]) for row in rows)
+    lines = [
+        f"{name:<{name_width}}  {duration:>{duration_width}}  {cost}".rstrip()
+        for name, duration, cost in rows
+    ]
+    lines.insert(-1, "-" * max(len(line) for line in lines))
+    return "\n".join(lines)
 
 
 def complete_diff(repo: Path, baseline: str) -> str:
@@ -345,12 +388,14 @@ def main() -> int:
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
+        "durations": {},
     }
     run_metadata = artifacts / "run.json"
     write(run_metadata, json.dumps(metadata, indent=2))
 
-    def record_usage(stage: str, usage: dict | None) -> None:
+    def record_stage(stage: str, usage: dict | None, duration: float) -> None:
         metadata["usage"][stage] = usage
+        metadata["durations"][stage] = duration
         write(run_metadata, json.dumps(metadata, indent=2))
 
     plan = artifacts / "01-plan.md"
@@ -368,6 +413,7 @@ def main() -> int:
     if args.max_budget_usd is not None:
         claude_base += ["--max-budget-usd", str(args.max_budget_usd)]
 
+    started = time.monotonic()
     usage = invoke(
         "Claude: plan",
         claude_base,
@@ -378,7 +424,7 @@ def main() -> int:
         timeout=args.stage_timeout_seconds,
         parse_json=True,
     )
-    record_usage("Claude: plan", usage)
+    record_stage("Claude: plan", usage, time.monotonic() - started)
 
     codex_cmd = [
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
@@ -386,6 +432,7 @@ def main() -> int:
     ]
     if args.codex_model:
         codex_cmd[2:2] = ["--model", args.codex_model]
+    started = time.monotonic()
     usage = invoke(
         "Codex: implement",
         codex_cmd,
@@ -395,8 +442,9 @@ def main() -> int:
         args.dry_run,
         timeout=args.stage_timeout_seconds,
     )
-    record_usage("Codex: implement", usage)
+    record_stage("Codex: implement", usage, time.monotonic() - started)
 
+    started = time.monotonic()
     usage = invoke(
         "Claude: review",
         claude_base,
@@ -407,7 +455,7 @@ def main() -> int:
         timeout=args.stage_timeout_seconds,
         parse_json=True,
     )
-    record_usage("Claude: review", usage)
+    record_stage("Claude: review", usage, time.monotonic() - started)
 
     reviews = [review]
     if mir_enabled:
@@ -431,6 +479,7 @@ def main() -> int:
             max_budget_usd=args.max_budget_usd,
         )
 
+        started = time.monotonic()
         usage = invoke(
             stage_label,
             mir_cmd,
@@ -442,7 +491,7 @@ def main() -> int:
             timeout=args.stage_timeout_seconds,
             parse_json=parse_json,
         )
-        record_usage("Mir: independent review", usage)
+        record_stage("Mir: independent review", usage, time.monotonic() - started)
         reviews.append(mir_review)
 
     if not args.skip_review_fix:
@@ -451,6 +500,7 @@ def main() -> int:
             print("\n==> Codex: address review (skipped — all reviews reported no actionable findings)")
         else:
             review_refs = " and ".join(str(p) for p in reviews)
+            started = time.monotonic()
             usage = invoke(
                 "Codex: address review",
                 codex_cmd[:-2] + [str(fix_result), "-"],
@@ -460,11 +510,14 @@ def main() -> int:
                 args.dry_run,
                 timeout=args.stage_timeout_seconds,
             )
-            record_usage("Codex: address review", usage)
+            record_stage("Codex: address review", usage, time.monotonic() - started)
 
     if not args.dry_run:
         write(artifacts / "final.diff", complete_diff(repo, baseline))
         write(artifacts / "final.status", git(repo, "status", "--short"))
+    summary_text = build_summary(metadata["durations"], metadata["usage"])
+    write(artifacts / "summary.txt", summary_text)
+    print(f"\n{summary_text}")
     print(f"\nComplete. Artifacts: {artifacts}")
     return 0
 

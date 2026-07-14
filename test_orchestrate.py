@@ -1,15 +1,120 @@
+import argparse
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from orchestrate import (
+    build_summary,
     extract_result_and_usage,
+    format_duration,
     invoke,
+    main,
     mirror_review_enabled,
     mirror_review_invocation,
     resolve_mir_skill,
 )
+
+
+class SummaryTests(unittest.TestCase):
+    def test_format_duration(self) -> None:
+        self.assertEqual(format_duration(0), "0:00")
+        self.assertEqual(format_duration(12.4), "0:12")
+        self.assertEqual(format_duration(65), "1:05")
+        self.assertEqual(format_duration(3661), "1:01:01")
+
+    def test_empty_summary(self) -> None:
+        self.assertEqual(build_summary({}, {}), "No stages executed.")
+
+    def test_summary_aligns_stages_and_totals_recorded_costs(self) -> None:
+        summary = build_summary(
+            {"Claude: plan": 12.4, "Codex: implement": 65},
+            {
+                "Claude: plan": {"total_cost_usd": 0.0421},
+                "Codex: implement": None,
+            },
+        )
+        lines = summary.splitlines()
+
+        self.assertIn("Claude: plan", lines[0])
+        self.assertIn("0:12", lines[0])
+        self.assertTrue(lines[0].endswith("$0.0421"))
+        self.assertIn("Codex: implement", lines[1])
+        self.assertTrue(lines[1].endswith("1:05"))
+        self.assertEqual(lines[-2], "-" * max(len(line) for line in lines if line != lines[-2]))
+        self.assertIn("Total", lines[-1])
+        self.assertIn("1:17", lines[-1])
+        self.assertTrue(lines[-1].endswith("$0.0421"))
+
+    def test_zero_cost_is_recorded(self) -> None:
+        summary = build_summary(
+            {"Claude: plan": 1},
+            {"Claude: plan": {"total_cost_usd": 0.0}},
+        )
+
+        self.assertEqual(summary.count("$0.0000"), 2)
+
+    def test_costless_summary_has_blank_total_cost(self) -> None:
+        summary = build_summary(
+            {"Codex: implement": 1},
+            {"Codex: implement": None},
+        )
+
+        self.assertNotIn("$", summary)
+        self.assertTrue(summary.splitlines()[-1].endswith("0:01"))
+
+    def test_main_persists_and_prints_summary_from_recorded_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git_dir = repo / ".git"
+            git_dir.mkdir()
+            args = argparse.Namespace(
+                task="test task", repo=repo, codex_model=None, claude_model=None,
+                hermes=False, hermes_model=None, mir=None, mir_backend=None,
+                mir_skills_dir=repo / "skills", max_budget_usd=None,
+                stage_timeout_seconds=None, allow_dirty=False,
+                skip_review_fix=False, dry_run=True,
+            )
+
+            def fake_git(_repo: Path, *git_args: str) -> str:
+                if git_args == ("rev-parse", "--show-toplevel"):
+                    return str(repo)
+                if git_args == ("rev-parse", "--path-format=absolute", "--git-dir"):
+                    return str(git_dir)
+                if git_args == ("rev-parse", "HEAD"):
+                    return "baseline"
+                if git_args == ("status", "--porcelain"):
+                    return ""
+                raise AssertionError(git_args)
+
+            usages = [
+                {"total_cost_usd": 0.1}, None,
+                {"total_cost_usd": 0.2}, None,
+            ]
+            output = io.StringIO()
+            with (
+                patch("orchestrate.parse_args", return_value=args),
+                patch("orchestrate.shutil.which", return_value="/bin/tool"),
+                patch("orchestrate.git", side_effect=fake_git),
+                patch("orchestrate.invoke", side_effect=usages),
+                patch("orchestrate.time.monotonic", side_effect=range(0, 16, 2)),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(main(), 0)
+
+            artifacts = next((git_dir / "agent-collab" / "runs").iterdir())
+            metadata = json.loads((artifacts / "run.json").read_text())
+            summary = (artifacts / "summary.txt").read_text().rstrip()
+            self.assertEqual(
+                list(metadata["durations"]),
+                ["Claude: plan", "Codex: implement", "Claude: review", "Codex: address review"],
+            )
+            self.assertEqual(list(metadata["durations"].values()), [2, 2, 2, 2])
+            self.assertEqual(summary.count("$0.3000"), 1)
+            self.assertIn(summary, output.getvalue())
 
 
 class ExtractResultAndUsageTests(unittest.TestCase):
