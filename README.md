@@ -49,6 +49,8 @@ Useful options:
 
 Each run is preserved under the target repository's private Git directory at `.git/agent-collab/runs/<timestamp>/`, including prompts, responses, final status, and a final patch. The patch includes both tracked changes and non-ignored untracked files. Because artifacts live under `.git`, they do not pollute the working tree.
 
+`run.json` records Claude's reported cost, token counts, and turn count under `usage`, keyed by stage name. Codex and Hermes stages are recorded as `null`; malformed Claude JSON also falls back to plain-text output with `null` usage.
+
 ## Safety model
 
 Claude runs in plan mode for analysis and review. Codex runs with workspace-write sandboxing. Hermes runs with all toolsets disabled and reviews only the diff text embedded in its prompt. The prompts prohibit commits and pushes, but you should still inspect the resulting diff before committing it.

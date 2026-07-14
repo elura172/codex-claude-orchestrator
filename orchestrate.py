@@ -106,6 +106,23 @@ def write(path: Path, content: str) -> None:
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
+def extract_result_and_usage(stdout: str) -> tuple[str, dict | None]:
+    """Extract Claude's response and accounting metadata from JSON output."""
+    try:
+        payload = json.loads(stdout)
+        result = payload["result"]
+        usage = payload["usage"]
+        if not isinstance(result, str) or not isinstance(usage, dict):
+            raise TypeError
+        return result, {
+            **usage,
+            "total_cost_usd": payload.get("total_cost_usd"),
+            "num_turns": payload.get("num_turns"),
+        }
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return stdout, None
+
+
 def complete_diff(repo: Path, baseline: str) -> str:
     """Return a patch containing tracked changes and non-ignored untracked files."""
     chunks = [git(repo, "diff", "--binary", "--no-ext-diff", baseline, "--")]
@@ -134,13 +151,14 @@ def invoke(
     dry_run: bool,
     prompt_flag: str | None = None,
     timeout: float | None = None,
-) -> None:
-    print(f"\n==> {name}")
+    parse_json: bool = False,
+) -> dict | None:
+    print(f"\n==> {name}", flush=True)
     write(output.with_suffix(output.suffix + ".prompt.md"), prompt)
     if dry_run:
         print(shlex.join(cmd))
         write(output, f"DRY RUN: {shlex.join(cmd)}")
-        return
+        return None
     try:
         if prompt_flag:
             result = run(cmd + [prompt_flag, prompt], cwd=repo, stream=True, timeout=timeout)
@@ -148,11 +166,15 @@ def invoke(
             result = run(cmd, cwd=repo, stdin=prompt, stream=True, timeout=timeout)
     except TimeoutError:
         raise StageTimeoutError(f"Stage timed out after {timeout:g} seconds: {name}") from None
+    usage = None
+    if parse_json:
+        result, usage = extract_result_and_usage(result)
     # Codex writes its final message itself; Claude prints to stdout.
     if not output.exists():
         write(output, result)
     elif result.strip():
         write(output.with_suffix(output.suffix + ".stdout.log"), result)
+    return usage
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,8 +241,14 @@ def main() -> int:
         "baseline": baseline,
         "hermes": args.hermes,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "usage": {},
     }
-    write(artifacts / "run.json", json.dumps(metadata, indent=2))
+    run_metadata = artifacts / "run.json"
+    write(run_metadata, json.dumps(metadata, indent=2))
+
+    def record_usage(stage: str, usage: dict | None) -> None:
+        metadata["usage"][stage] = usage
+        write(run_metadata, json.dumps(metadata, indent=2))
 
     plan = artifacts / "01-plan.md"
     codex_result = artifacts / "02-implementation.md"
@@ -230,14 +258,14 @@ def main() -> int:
 
     claude_base = [
         "claude", "--print", "--no-session-persistence", "--permission-mode", "plan",
-        "--tools", "Read,Grep,Glob,Bash", "--output-format", "text",
+        "--tools", "Read,Grep,Glob,Bash", "--output-format", "json",
     ]
     if args.claude_model:
         claude_base += ["--model", args.claude_model]
     if args.max_budget_usd is not None:
         claude_base += ["--max-budget-usd", str(args.max_budget_usd)]
 
-    invoke(
+    usage = invoke(
         "Claude: plan",
         claude_base,
         f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}""",
@@ -245,7 +273,9 @@ def main() -> int:
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
+        parse_json=True,
     )
+    record_usage("Claude: plan", usage)
 
     codex_cmd = [
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
@@ -253,7 +283,7 @@ def main() -> int:
     ]
     if args.codex_model:
         codex_cmd[2:2] = ["--model", args.codex_model]
-    invoke(
+    usage = invoke(
         "Codex: implement",
         codex_cmd,
         f"""Implement the requested task in this repository. Read the plan at {plan}. Inspect the code yourself, keep changes scoped, and run relevant tests. Do not commit, push, or discard pre-existing changes.\n\nTASK:\n{args.task}""",
@@ -262,8 +292,9 @@ def main() -> int:
         args.dry_run,
         timeout=args.stage_timeout_seconds,
     )
+    record_usage("Codex: implement", usage)
 
-    invoke(
+    usage = invoke(
         "Claude: review",
         claude_base,
         f"""Act as a strict code reviewer. Review all working-tree changes relative to baseline commit {baseline} for the task below. Use git status, git diff, and inspect every relevant untracked file as well as tracked changes. Do not edit anything. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}""",
@@ -271,7 +302,9 @@ def main() -> int:
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
+        parse_json=True,
     )
+    record_usage("Claude: review", usage)
 
     reviews = [review]
     if args.hermes:
@@ -283,7 +316,7 @@ def main() -> int:
         hermes_cmd = ["hermes", "-t", ""]
         if args.hermes_model:
             hermes_cmd += ["-m", args.hermes_model]
-        invoke(
+        usage = invoke(
             "Hermes: independent review",
             hermes_cmd,
             f"""Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}""",
@@ -293,6 +326,7 @@ def main() -> int:
             prompt_flag="-z",
             timeout=args.stage_timeout_seconds,
         )
+        record_usage("Hermes: independent review", usage)
         reviews.append(mirai_review)
 
     if not args.skip_review_fix:
@@ -301,7 +335,7 @@ def main() -> int:
             print("\n==> Codex: address review (skipped — all reviews reported no actionable findings)")
         else:
             review_refs = " and ".join(str(p) for p in reviews)
-            invoke(
+            usage = invoke(
                 "Codex: address review",
                 codex_cmd[:-2] + [str(fix_result), "-"],
                 f"""Read every review at {review_refs}. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push. If a review says NO ACTIONABLE FINDINGS, it requires no changes.\n\nTASK:\n{args.task}""",
@@ -310,6 +344,7 @@ def main() -> int:
                 args.dry_run,
                 timeout=args.stage_timeout_seconds,
             )
+            record_usage("Codex: address review", usage)
 
     if not args.dry_run:
         write(artifacts / "final.diff", complete_diff(repo, baseline))
