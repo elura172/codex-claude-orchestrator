@@ -21,6 +21,8 @@ from orchestrate import (
     mirror_review_enabled,
     mirror_review_invocation,
     resolve_mir_skill,
+    review_is_clean,
+    tree_fingerprint,
 )
 
 
@@ -50,6 +52,56 @@ class SynthesisPromptTests(unittest.TestCase):
         prompt = build_synthesis_prompt("t", [("big.md", "x" * (SYNTHESIS_CAP + 1000))])
         self.assertIn("[reviews truncated for length]", prompt)
         self.assertLess(len(prompt), SYNTHESIS_CAP + 2000)
+
+
+class SealTests(unittest.TestCase):
+    def test_clean_seal_on_last_line(self) -> None:
+        self.assertTrue(review_is_clean("I looked at everything.\n\nSEAL: CLEAN\n"))
+        self.assertTrue(review_is_clean("seal: clean"))
+
+    def test_findings_seal_is_not_clean(self) -> None:
+        self.assertFalse(review_is_clean("HIGH: race in run().\n\nSEAL: FINDINGS 1"))
+
+    def test_quoted_sentinel_cannot_fake_cleanliness(self) -> None:
+        text = (
+            "The prompt told me to say exactly: NO ACTIONABLE FINDINGS if none.\n"
+            "But there are three HIGH findings.\n"
+            "SEAL: FINDINGS 3"
+        )
+        self.assertFalse(review_is_clean(text))
+
+    def test_legacy_sentinel_fallback(self) -> None:
+        self.assertTrue(review_is_clean("NO ACTIONABLE FINDINGS"))
+        self.assertFalse(review_is_clean("NO ACTIONABLE FINDINGS", require_seal=True))
+
+    def test_no_verdict_is_not_clean(self) -> None:
+        self.assertFalse(review_is_clean("HIGH: something is wrong."))
+        self.assertFalse(review_is_clean(""))
+
+    def test_malformed_seal_is_not_clean(self) -> None:
+        self.assertFalse(review_is_clean("all good\nSEAL: PROBABLY FINE"))
+
+
+class StillnessTests(unittest.TestCase):
+    def test_fingerprint_detects_and_forgives_tree_changes(self) -> None:
+        from orchestrate import git
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git(repo, "init", "-q")
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-q", "--allow-empty", "-m", "seed")
+            baseline = git(repo, "rev-parse", "HEAD")
+
+            before = tree_fingerprint(repo, baseline)
+            mark = repo / "mark.txt"
+            mark.write_text("a spirit was here\n", encoding="utf-8")
+            during = tree_fingerprint(repo, baseline)
+            mark.unlink()
+            after = tree_fingerprint(repo, baseline)
+
+            self.assertNotEqual(before, during)
+            self.assertEqual(before, after)
 
 
 class LineageTests(unittest.TestCase):
@@ -148,7 +200,7 @@ class SummaryTests(unittest.TestCase):
                 task="test task", repo=repo, codex_model=None, claude_model=None,
                 hermes=False, hermes_model=None, mir=None, mir_backend=None,
                 synthesize=False, synthesize_backend=None, synthesize_node=None,
-                lineage=0,
+                lineage=0, vow_policy="taint",
                 mir_skills_dir=repo / "skills", max_budget_usd=None,
                 stage_timeout_seconds=None, allow_dirty=False,
                 skip_review_fix=False, dry_run=True,

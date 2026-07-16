@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -188,6 +189,29 @@ def complete_diff(repo: Path, baseline: str) -> str:
     return "\n".join(chunk.rstrip() for chunk in chunks if chunk).rstrip()
 
 
+def tree_fingerprint(repo: Path, baseline: str) -> str:
+    """Fingerprint the working tree relative to baseline, for vow-of-stillness checks."""
+    material = complete_diff(repo, baseline) + "\0" + git(repo, "status", "--porcelain")
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def review_is_clean(text: str, require_seal: bool = False) -> bool:
+    """Read a review's verdict from its sealing line.
+
+    The seal must be the last non-empty line, so a review that merely quotes
+    the instructions cannot be misread as clean. Reviews without a seal fall
+    back to the legacy sentinel unless require_seal is set.
+    """
+    for line in reversed(text.strip().splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.upper().startswith("SEAL:"):
+            return stripped.upper() == "SEAL: CLEAN"
+        break
+    return not require_seal and "NO ACTIONABLE FINDINGS" in text
+
+
 def list_mir_nodes(skills_dir: Path) -> list[str]:
     if not skills_dir.is_dir():
         return []
@@ -303,7 +327,7 @@ def build_synthesis_prompt(
 3. DISAGREEMENTS — anywhere reviewers contradict each other on severity, diagnosis, or fix. State each side's case.
 4. UNIFIED VERDICT — one go/no-go with a priority-ordered action list. Deduplicate; each action names the finding(s) it resolves and the reviewers behind it.
 
-Be concise and evidence-bound; cite reviewers by their review's name.
+Be concise and evidence-bound; cite reviewers by their review's name. End the document with exactly one final line: SEAL: CLEAN if no finding survives synthesis, else SEAL: FINDINGS <n>.
 
 TASK UNDER REVIEW:
 {task}
@@ -405,6 +429,14 @@ def parse_args() -> argparse.Namespace:
         help=("Hand the planning stage the syntheses of the N most recent "
               "prior runs in this repository (default: 0, no lineage)"),
     )
+    parser.add_argument(
+        "--vow-policy",
+        choices=["warn", "taint", "abort"],
+        default="taint",
+        help=("What a broken vow of stillness does: warn and continue, "
+              "taint (exclude the breaching review from synthesis and fix), "
+              "or abort the run (default: taint)"),
+    )
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
@@ -498,6 +530,8 @@ def main() -> int:
         "synthesize_backend": synth_backend if synth_enabled else None,
         "synthesize_node": args.synthesize_node if synth_enabled else None,
         "lineage": [name for name, _ in lineage],
+        "vow_policy": args.vow_policy,
+        "vows": {},
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
@@ -561,7 +595,7 @@ def main() -> int:
     usage = invoke(
         "Claude: review",
         claude_base,
-        f"""Act as a strict code reviewer. Review all working-tree changes relative to baseline commit {baseline} for the task below. Use git status, git diff, and inspect every relevant untracked file as well as tracked changes. Do not edit anything. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}""",
+        f"""Act as a strict code reviewer. Review all working-tree changes relative to baseline commit {baseline} for the task below. Use git status, git diff, and inspect every relevant untracked file as well as tracked changes. Do not edit anything. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{args.task}""",
         review,
         repo,
         args.dry_run,
@@ -578,10 +612,12 @@ def main() -> int:
         diff_text = complete_diff(repo, baseline)
         if len(diff_text) > 120_000:
             diff_text = diff_text[:120_000] + "\n[diff truncated for length]"
+        metadata["scroll_sha256"] = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+        fingerprint = None if args.dry_run else tree_fingerprint(repo, baseline)
         for node in mir_nodes or [None]:
             skill_text = mir_skill_texts.get(node) if node else None
             skill_prefix = f"{skill_text}\n\n---\n\n" if skill_text else ""
-            mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
+            mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
             node_tag = f", {node}" if node else ""
             stage_label = f"Mir ({mir_backend}{node_tag}): independent review"
             mir_review = artifacts / (f"03b-mir-{node}-review.md" if node else "03b-mir-review.md")
@@ -609,10 +645,37 @@ def main() -> int:
                 timeout=args.stage_timeout_seconds,
                 parse_json=parse_json,
             )
-            record_stage(stage_label, usage, time.monotonic() - started)
-            reviews.append(mir_review)
+            duration = time.monotonic() - started
+            tainted = False
+            if fingerprint is not None:
+                after = tree_fingerprint(repo, baseline)
+                if after == fingerprint:
+                    metadata["vows"][stage_label] = "kept"
+                else:
+                    # Re-baseline so later nodes aren't blamed for this breach.
+                    metadata["vows"][stage_label] = "broken"
+                    fingerprint = after
+                    print(
+                        f"warning: vow of stillness broken — the working tree changed during {stage_label}",
+                        file=sys.stderr,
+                    )
+                    if args.vow_policy == "abort":
+                        record_stage(stage_label, usage, duration)
+                        raise RuntimeError(
+                            f"vow of stillness broken during {stage_label} (--vow-policy abort)"
+                        )
+                    if args.vow_policy == "taint":
+                        tainted = True
+                        print(
+                            f"warning: {mir_review.name} is tainted and excluded from synthesis and fix",
+                            file=sys.stderr,
+                        )
+            record_stage(stage_label, usage, duration)
+            if not tainted:
+                reviews.append(mir_review)
 
     synthesis = artifacts / "03c-synthesis.md"
+    synth_tainted = False
     if synth_enabled:
         # Recombination: every review in, one convergence-weighted document out.
         # The synthesizer sees only the review texts — no repo, no diff.
@@ -634,6 +697,7 @@ def main() -> int:
             codex_model=args.codex_model,
             max_budget_usd=args.max_budget_usd,
         )
+        synth_before = None if args.dry_run else tree_fingerprint(repo, baseline)
         started = time.monotonic()
         usage = invoke(
             stage_label,
@@ -646,18 +710,62 @@ def main() -> int:
             timeout=args.stage_timeout_seconds,
             parse_json=parse_json,
         )
-        record_stage(stage_label, usage, time.monotonic() - started)
+        duration = time.monotonic() - started
+        if not args.dry_run:
+            metadata["synthesis_inputs"] = [p.name for p in reviews if p.is_file()]
+        if synth_before is not None:
+            if tree_fingerprint(repo, baseline) == synth_before:
+                metadata["vows"][stage_label] = "kept"
+            else:
+                metadata["vows"][stage_label] = "broken"
+                print(
+                    f"warning: vow of stillness broken — the working tree changed during {stage_label}",
+                    file=sys.stderr,
+                )
+                if args.vow_policy == "abort":
+                    record_stage(stage_label, usage, duration)
+                    raise RuntimeError(
+                        f"vow of stillness broken during {stage_label} (--vow-policy abort)"
+                    )
+                if args.vow_policy == "taint":
+                    synth_tainted = True
+                    print(
+                        "warning: the synthesis is tainted — the fix stage will use the reviews directly",
+                        file=sys.stderr,
+                    )
+        record_stage(stage_label, usage, duration)
+
+    if not args.dry_run:
+        metadata["artifacts_sha256"] = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in [*reviews, synthesis]
+            if p.is_file()
+        }
+        write(run_metadata, json.dumps(metadata, indent=2))
 
     if not args.skip_review_fix:
         texts = [] if args.dry_run else [p.read_text(encoding="utf-8") for p in reviews]
-        if texts and all("NO ACTIONABLE FINDINGS" in t for t in texts):
-            print("\n==> Codex: address review (skipped — all reviews reported no actionable findings)")
+        all_clean = bool(texts) and all(review_is_clean(t) for t in texts)
+        synthesis_clean = (
+            synth_enabled
+            and not synth_tainted
+            and not args.dry_run
+            and synthesis.is_file()
+            and review_is_clean(synthesis.read_text(encoding="utf-8"), require_seal=True)
+        )
+        if all_clean or synthesis_clean:
+            reason = (
+                "all reviews are sealed clean"
+                if all_clean
+                else "the synthesis is sealed clean"
+            )
+            print(f"\n==> Codex: address review (skipped — {reason})")
         else:
             review_refs = " and ".join(str(p) for p in reviews)
-            if synth_enabled:
+            if synth_enabled and not synth_tainted:
                 fix_prompt = f"""Read the synthesis at {synthesis}, which recombines every review at {review_refs} into a convergence map and a priority-ordered action list. Work from the synthesis; consult the underlying reviews when you need a finding's full evidence. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push.\n\nTASK:\n{args.task}"""
             else:
-                fix_prompt = f"""Read every review at {review_refs}. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push. If a review says NO ACTIONABLE FINDINGS, it requires no changes.\n\nTASK:\n{args.task}"""
+                fix_prompt = f"""Read every review at {review_refs}. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push. A review whose final line is SEAL: CLEAN requires no changes.\n\nTASK:\n{args.task}"""
             started = time.monotonic()
             usage = invoke(
                 "Codex: address review",

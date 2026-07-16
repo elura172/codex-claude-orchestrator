@@ -46,6 +46,7 @@ Useful options:
 --synthesize-backend {hermes,claude,codex}
 --synthesize-node NODE
 --lineage N
+--vow-policy {warn,taint,abort}
 --max-budget-usd AMOUNT
 --stage-timeout-seconds SECONDS
 --skip-review-fix
@@ -71,5 +72,13 @@ Each run is preserved under the target repository's private Git directory at `.g
 ## Safety model
 
 Claude runs in plan mode for analysis and review. Codex implementation stages run with workspace-write sandboxing. In the independent mirror review, Claude runs in plan mode with no tools and Codex runs in a read-only sandbox.
+
+### Vows
+
+Reviewer isolation is delegated to each backend's own sandboxing, so the orchestrator verifies rather than trusts:
+
+- **Stillness.** The working tree is fingerprinted (diff + status hash) before the mirror reviews and re-checked after each one, and after the synthesis. A review that changed the tree broke its vow: `--vow-policy` decides whether that warns, taints (excludes the breaching review from synthesis and fix — the default), or aborts the run. Verdicts are recorded per stage under `vows` in `run.json`; a tainted synthesis drops the fix stage back to the raw reviews.
+- **Seal.** Every review and the synthesis must end with a final line `SEAL: CLEAN` or `SEAL: FINDINGS <n>`. Verdicts are read only from that line, so a review that merely quotes the words "no actionable findings" cannot be misread as clean. Reviews without a seal fall back to the legacy sentinel. The fix stage is skipped when all reviews are sealed clean, or when the synthesis — which weighs every review — is sealed clean.
+- **Provenance.** `run.json` records the SHA-256 of the frozen diff handed to the mirror reviewers (`scroll_sha256`), of every review and synthesis artifact (`artifacts_sha256`), and which review files the synthesizer received (`synthesis_inputs`) — enough to audit later what each stage actually saw.
 
 **Known hole (hermes backend):** Hermes >=0.18.2 ignores `-t ""` — the toolsets flag no longer restricts anything, and `--skills` force-enables each skill's declared toolsets. Hermes mirror reviewers therefore run with full tool access (file writes, terminal), and prompt-level "you have no tools" instructions are demonstrably not honored. Until hermes regains a tool-less oneshot mode, use `--mir-backend claude` or `codex` when the review must not touch the tree; the orchestrator prints a warning when the hermes backend is selected. Every mirror backend reviews only the diff text embedded in its prompt. The prompts prohibit commits and pushes, but you should still inspect the resulting diff before committing it.
