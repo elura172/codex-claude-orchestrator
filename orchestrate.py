@@ -209,9 +209,9 @@ def resolve_mir_skill(skills_dir: Path, node: str) -> Path:
 
 
 def mirror_review_enabled(
-    hermes: bool, mir_node: str | None, mir_backend: str | None
+    hermes: bool, mir_nodes: str | list[str] | None, mir_backend: str | None
 ) -> bool:
-    return hermes or mir_node is not None or mir_backend is not None
+    return hermes or bool(mir_nodes) or mir_backend is not None
 
 
 def mirror_review_invocation(
@@ -303,8 +303,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
     parser.add_argument(
         "--mir",
+        action="append",
         help=("Mirror-node lens for the independent second review "
-              "(a subdirectory of --mir-skills-dir containing SKILL.md)"),
+              "(a subdirectory of --mir-skills-dir containing SKILL.md); "
+              "repeatable — each node reviews the same diff independently"),
     )
     parser.add_argument(
         "--mir-backend",
@@ -336,17 +338,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     mir_backend = args.mir_backend or "hermes"
-    mir_enabled = mirror_review_enabled(args.hermes, args.mir, args.mir_backend)
+    mir_nodes: list[str] = args.mir or []
+    mir_enabled = mirror_review_enabled(args.hermes, mir_nodes, args.mir_backend)
     mir_skills_dir = args.mir_skills_dir.expanduser().resolve()
-    mir_skill_text = None
-    if args.mir is not None:
-        mir_skill_file = resolve_mir_skill(mir_skills_dir, args.mir)
-        if mir_backend != "hermes":
-            mir_skill_text = mir_skill_file.read_text(encoding="utf-8")
+    mir_skill_texts: dict[str, str | None] = {}
+    for node in mir_nodes:
+        skill_file = resolve_mir_skill(mir_skills_dir, node)
+        mir_skill_texts[node] = (
+            skill_file.read_text(encoding="utf-8") if mir_backend != "hermes" else None
+        )
 
     executables = ["git", "codex", "claude"]
     if mir_enabled and mir_backend == "hermes":
         executables.append("hermes")
+        print(
+            "warning: hermes >=0.18.2 ignores `-t \"\"` (and --skills force-enables its "
+            "declared toolsets), so hermes mirror reviewers run with FULL tool access — "
+            "including file writes and terminal — despite the prompt telling them otherwise. "
+            "Verified empirically 2026-07-15: reviewers overwrote each other's output files. "
+            "Use --mir-backend claude or codex for an actually-sandboxed review until fixed.",
+            file=sys.stderr,
+        )
     for executable in executables:
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable not found: {executable}")
@@ -383,7 +395,7 @@ def main() -> int:
         "baseline": baseline,
         "hermes": args.hermes,
         "mir_enabled": mir_enabled,
-        "mir_node": args.mir,
+        "mir_nodes": mir_nodes,
         "mir_backend": mir_backend if mir_enabled else None,
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -401,7 +413,6 @@ def main() -> int:
     plan = artifacts / "01-plan.md"
     codex_result = artifacts / "02-implementation.md"
     review = artifacts / "03-review.md"
-    mir_review = artifacts / "03b-mir-review.md"
     fix_result = artifacts / "04-fixes.md"
 
     claude_base = [
@@ -459,40 +470,45 @@ def main() -> int:
 
     reviews = [review]
     if mir_enabled:
-        # The mirror reviewer never sees Claude's review or uses repository
-        # tools, so every backend receives the diff inside its prompt.
+        # The mirror reviewers never see Claude's review or use repository
+        # tools, so every backend receives the diff inside its prompt. Each
+        # node reviews the same diff independently of the others.
         diff_text = complete_diff(repo, baseline)
         if len(diff_text) > 120_000:
             diff_text = diff_text[:120_000] + "\n[diff truncated for length]"
-        skill_prefix = f"{mir_skill_text}\n\n---\n\n" if mir_skill_text else ""
-        mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
-        stage_label = f"Mir ({mir_backend}): independent review"
+        for node in mir_nodes or [None]:
+            skill_text = mir_skill_texts.get(node) if node else None
+            skill_prefix = f"{skill_text}\n\n---\n\n" if skill_text else ""
+            mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. If there are none, say exactly: NO ACTIONABLE FINDINGS.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
+            node_tag = f", {node}" if node else ""
+            stage_label = f"Mir ({mir_backend}{node_tag}): independent review"
+            mir_review = artifacts / (f"03b-mir-{node}-review.md" if node else "03b-mir-review.md")
 
-        mir_cmd, prompt_flag, parse_json = mirror_review_invocation(
-            mir_backend,
-            repo=repo,
-            output=mir_review,
-            node=args.mir,
-            hermes_model=args.hermes_model,
-            claude_model=args.claude_model,
-            codex_model=args.codex_model,
-            max_budget_usd=args.max_budget_usd,
-        )
+            mir_cmd, prompt_flag, parse_json = mirror_review_invocation(
+                mir_backend,
+                repo=repo,
+                output=mir_review,
+                node=node,
+                hermes_model=args.hermes_model,
+                claude_model=args.claude_model,
+                codex_model=args.codex_model,
+                max_budget_usd=args.max_budget_usd,
+            )
 
-        started = time.monotonic()
-        usage = invoke(
-            stage_label,
-            mir_cmd,
-            mir_prompt,
-            mir_review,
-            repo,
-            args.dry_run,
-            prompt_flag=prompt_flag,
-            timeout=args.stage_timeout_seconds,
-            parse_json=parse_json,
-        )
-        record_stage("Mir: independent review", usage, time.monotonic() - started)
-        reviews.append(mir_review)
+            started = time.monotonic()
+            usage = invoke(
+                stage_label,
+                mir_cmd,
+                mir_prompt,
+                mir_review,
+                repo,
+                args.dry_run,
+                prompt_flag=prompt_flag,
+                timeout=args.stage_timeout_seconds,
+                parse_json=parse_json,
+            )
+            record_stage(stage_label, usage, time.monotonic() - started)
+            reviews.append(mir_review)
 
     if not args.skip_review_fix:
         texts = [] if args.dry_run else [p.read_text(encoding="utf-8") for p in reviews]

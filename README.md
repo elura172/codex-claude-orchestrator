@@ -39,7 +39,7 @@ Useful options:
 --claude-model MODEL
 --hermes
 --hermes-model MODEL
---mir NODE
+--mir NODE                 (repeatable)
 --mir-backend {hermes,claude,codex}
 --mir-skills-dir PATH
 --max-budget-usd AMOUNT
@@ -49,6 +49,8 @@ Useful options:
 ```
 
 `--stage-timeout-seconds` applies a wall-clock timeout to each agent invocation. By default, agent invocations have no timeout.
+
+`--mir NODE` is repeatable: each node reviews the same frozen diff independently — one plan/implement cycle, N sealed-room reviews, each with its own artifact (`03b-mir-<node>-review.md`) and its own stage entry in `run.json` and the summary.
 
 `--mir NODE` applies a mirror-node lens from `<mir-skills-dir>/<NODE>/SKILL.md`; the skills directory defaults to `~/.hermes/skills/mirror-nodes`. The mirror backend defaults to Hermes. Supplying `--mir` or `--mir-backend` enables the independent review without `--hermes`; `--hermes` remains available for backward compatibility. Hermes receives the node name through its native `--skills` option after the configured directory is used for pre-flight validation; Hermes itself resolves that name using its own skill configuration. Claude and Codex instead receive the validated skill file's text at the start of their review prompt.
 
@@ -60,4 +62,6 @@ Each run is preserved under the target repository's private Git directory at `.g
 
 ## Safety model
 
-Claude runs in plan mode for analysis and review. Codex implementation stages run with workspace-write sandboxing. In the independent mirror review, Hermes runs with all toolsets disabled, Claude runs in plan mode with no tools, and Codex runs in a read-only sandbox. Every mirror backend reviews only the diff text embedded in its prompt. The prompts prohibit commits and pushes, but you should still inspect the resulting diff before committing it.
+Claude runs in plan mode for analysis and review. Codex implementation stages run with workspace-write sandboxing. In the independent mirror review, Claude runs in plan mode with no tools and Codex runs in a read-only sandbox.
+
+**Known hole (hermes backend):** Hermes >=0.18.2 ignores `-t ""` — the toolsets flag no longer restricts anything, and `--skills` force-enables each skill's declared toolsets. Hermes mirror reviewers therefore run with full tool access (file writes, terminal), and prompt-level "you have no tools" instructions are demonstrably not honored. Until hermes regains a tool-less oneshot mode, use `--mir-backend claude` or `codex` when the review must not touch the tree; the orchestrator prints a warning when the hermes backend is selected. Every mirror backend reviews only the diff text embedded in its prompt. The prompts prohibit commits and pushes, but you should still inspect the resulting diff before committing it.
