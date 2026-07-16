@@ -257,13 +257,16 @@ def mirror_review_invocation(
 SYNTHESIS_CAP = 120_000
 
 
-def build_synthesis_prompt(task: str, reviews: list[tuple[str, str]]) -> str:
+def build_synthesis_prompt(
+    task: str, reviews: list[tuple[str, str]], skill_text: str | None = None
+) -> str:
     """Prompt for the recombination stage: all reviews in, one document out."""
     sections = [f"### REVIEW: {name}\n{text.strip()}" for name, text in reviews]
     body = "\n\n".join(sections) or "(no reviews available)"
     if len(body) > SYNTHESIS_CAP:
         body = body[:SYNTHESIS_CAP] + "\n[reviews truncated for length]"
-    return f"""You are the recombining stage of a multi-reviewer pipeline. Several reviewers independently examined the same working-tree change; their complete reviews are below. You have no tools this session and must judge only from these texts. Do not merge them into a flat list — perform the actual synthesis:
+    skill_prefix = f"{skill_text}\n\n---\n\n" if skill_text else ""
+    return f"""{skill_prefix}You are the recombining stage of a multi-reviewer pipeline. Several reviewers independently examined the same working-tree change; their complete reviews are below. You have no tools this session and must judge only from these texts. Do not merge them into a flat list — perform the actual synthesis:
 
 1. CONVERGENCE MAP — findings reported by more than one reviewer. For each: the finding, which reviewers flagged it, and the strongest quoted evidence. Convergence across independent reviewers is the highest-confidence signal.
 2. SINGULAR FINDINGS — findings seen by exactly one reviewer. For each, assess plausibility strictly from the quoted evidence: unique insight, or noise?
@@ -358,6 +361,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Backend for the synthesis stage (default: claude); passing this option enables synthesis",
     )
+    parser.add_argument(
+        "--synthesize-node",
+        help=("Mirror-node lens for the synthesis stage "
+              "(a subdirectory of --mir-skills-dir containing SKILL.md); "
+              "passing this option enables synthesis"),
+    )
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
@@ -385,8 +394,17 @@ def main() -> int:
             skill_file.read_text(encoding="utf-8") if mir_backend != "hermes" else None
         )
 
-    synth_enabled = args.synthesize or args.synthesize_backend is not None
+    synth_enabled = (
+        args.synthesize
+        or args.synthesize_backend is not None
+        or args.synthesize_node is not None
+    )
     synth_backend = args.synthesize_backend or "claude"
+    synth_skill_text = None
+    if synth_enabled and args.synthesize_node:
+        synth_skill_file = resolve_mir_skill(mir_skills_dir, args.synthesize_node)
+        if synth_backend != "hermes":
+            synth_skill_text = synth_skill_file.read_text(encoding="utf-8")
 
     executables = ["git", "codex", "claude"]
     if (mir_enabled and mir_backend == "hermes") or (synth_enabled and synth_backend == "hermes"):
@@ -439,6 +457,7 @@ def main() -> int:
         "mir_backend": mir_backend if mir_enabled else None,
         "synthesize": synth_enabled,
         "synthesize_backend": synth_backend if synth_enabled else None,
+        "synthesize_node": args.synthesize_node if synth_enabled else None,
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
@@ -561,13 +580,14 @@ def main() -> int:
             if args.dry_run
             else [(p.name, p.read_text(encoding="utf-8")) for p in reviews if p.is_file()]
         )
-        synth_prompt = build_synthesis_prompt(args.task, labeled)
-        stage_label = f"Synthesis ({synth_backend}): recombination"
+        synth_prompt = build_synthesis_prompt(args.task, labeled, synth_skill_text)
+        synth_tag = f", {args.synthesize_node}" if args.synthesize_node else ""
+        stage_label = f"Synthesis ({synth_backend}{synth_tag}): recombination"
         synth_cmd, prompt_flag, parse_json = mirror_review_invocation(
             synth_backend,
             repo=repo,
             output=synthesis,
-            node=None,
+            node=args.synthesize_node,
             hermes_model=args.hermes_model,
             claude_model=args.claude_model,
             codex_model=args.codex_model,

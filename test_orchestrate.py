@@ -34,6 +34,11 @@ class SynthesisPromptTests(unittest.TestCase):
         self.assertIn("the task", prompt)
         self.assertIn("CONVERGENCE MAP", prompt)
 
+    def test_skill_text_prefixes_prompt(self) -> None:
+        prompt = build_synthesis_prompt("t", [("r.md", "x")], skill_text="OM LENS")
+        self.assertTrue(prompt.startswith("OM LENS\n\n---\n\n"))
+        self.assertIn("CONVERGENCE MAP", prompt)
+
     def test_empty_reviews_placeholder(self) -> None:
         prompt = build_synthesis_prompt("t", [])
         self.assertIn("(no reviews available)", prompt)
@@ -99,7 +104,7 @@ class SummaryTests(unittest.TestCase):
             args = argparse.Namespace(
                 task="test task", repo=repo, codex_model=None, claude_model=None,
                 hermes=False, hermes_model=None, mir=None, mir_backend=None,
-                synthesize=False, synthesize_backend=None,
+                synthesize=False, synthesize_backend=None, synthesize_node=None,
                 mir_skills_dir=repo / "skills", max_budget_usd=None,
                 stage_timeout_seconds=None, allow_dirty=False,
                 skip_review_fix=False, dry_run=True,
