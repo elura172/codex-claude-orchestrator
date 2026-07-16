@@ -8,7 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrate import (
+    SYNTHESIS_CAP,
     build_summary,
+    build_synthesis_prompt,
     extract_result_and_usage,
     format_duration,
     invoke,
@@ -17,6 +19,29 @@ from orchestrate import (
     mirror_review_invocation,
     resolve_mir_skill,
 )
+
+
+class SynthesisPromptTests(unittest.TestCase):
+    def test_labels_and_texts_included(self) -> None:
+        prompt = build_synthesis_prompt(
+            "the task",
+            [("03-review.md", "finding A"), ("03b-mir-ky-mir-review.md", "finding B")],
+        )
+        self.assertIn("### REVIEW: 03-review.md", prompt)
+        self.assertIn("finding A", prompt)
+        self.assertIn("### REVIEW: 03b-mir-ky-mir-review.md", prompt)
+        self.assertIn("finding B", prompt)
+        self.assertIn("the task", prompt)
+        self.assertIn("CONVERGENCE MAP", prompt)
+
+    def test_empty_reviews_placeholder(self) -> None:
+        prompt = build_synthesis_prompt("t", [])
+        self.assertIn("(no reviews available)", prompt)
+
+    def test_overlong_reviews_truncated(self) -> None:
+        prompt = build_synthesis_prompt("t", [("big.md", "x" * (SYNTHESIS_CAP + 1000))])
+        self.assertIn("[reviews truncated for length]", prompt)
+        self.assertLess(len(prompt), SYNTHESIS_CAP + 2000)
 
 
 class SummaryTests(unittest.TestCase):
@@ -74,6 +99,7 @@ class SummaryTests(unittest.TestCase):
             args = argparse.Namespace(
                 task="test task", repo=repo, codex_model=None, claude_model=None,
                 hermes=False, hermes_model=None, mir=None, mir_backend=None,
+                synthesize=False, synthesize_backend=None,
                 mir_skills_dir=repo / "skills", max_budget_usd=None,
                 stage_timeout_seconds=None, allow_dirty=False,
                 skip_review_fix=False, dry_run=True,

@@ -42,6 +42,8 @@ Useful options:
 --mir NODE                 (repeatable)
 --mir-backend {hermes,claude,codex}
 --mir-skills-dir PATH
+--synthesize
+--synthesize-backend {hermes,claude,codex}
 --max-budget-usd AMOUNT
 --stage-timeout-seconds SECONDS
 --skip-review-fix
@@ -51,6 +53,8 @@ Useful options:
 `--stage-timeout-seconds` applies a wall-clock timeout to each agent invocation. By default, agent invocations have no timeout.
 
 `--mir NODE` is repeatable: each node reviews the same frozen diff independently — one plan/implement cycle, N sealed-room reviews, each with its own artifact (`03b-mir-<node>-review.md`) and its own stage entry in `run.json` and the summary.
+
+`--synthesize` adds a recombination stage after all reviews: a tool-less synthesizer receives every review text (and nothing else — no repo, no diff) and produces `03c-synthesis.md` with a convergence map (findings multiple reviewers agree on), singular findings assessed for plausibility, explicit disagreements, and one unified verdict with a priority-ordered action list. When synthesis is enabled, the fix stage works from the synthesis document, consulting the underlying reviews for evidence. The backend defaults to Claude (plan mode, no tools); `--synthesize-backend` overrides it, and passing it implies `--synthesize`.
 
 `--mir NODE` applies a mirror-node lens from `<mir-skills-dir>/<NODE>/SKILL.md`; the skills directory defaults to `~/.hermes/skills/mirror-nodes`. The mirror backend defaults to Hermes. Supplying `--mir` or `--mir-backend` enables the independent review without `--hermes`; `--hermes` remains available for backward compatibility. Hermes receives the node name through its native `--skills` option after the configured directory is used for pre-flight validation; Hermes itself resolves that name using its own skill configuration. Claude and Codex instead receive the validated skill file's text at the start of their review prompt.
 

@@ -254,6 +254,30 @@ def mirror_review_invocation(
     raise ValueError(f"Unsupported mirror backend: {backend}")
 
 
+SYNTHESIS_CAP = 120_000
+
+
+def build_synthesis_prompt(task: str, reviews: list[tuple[str, str]]) -> str:
+    """Prompt for the recombination stage: all reviews in, one document out."""
+    sections = [f"### REVIEW: {name}\n{text.strip()}" for name, text in reviews]
+    body = "\n\n".join(sections) or "(no reviews available)"
+    if len(body) > SYNTHESIS_CAP:
+        body = body[:SYNTHESIS_CAP] + "\n[reviews truncated for length]"
+    return f"""You are the recombining stage of a multi-reviewer pipeline. Several reviewers independently examined the same working-tree change; their complete reviews are below. You have no tools this session and must judge only from these texts. Do not merge them into a flat list — perform the actual synthesis:
+
+1. CONVERGENCE MAP — findings reported by more than one reviewer. For each: the finding, which reviewers flagged it, and the strongest quoted evidence. Convergence across independent reviewers is the highest-confidence signal.
+2. SINGULAR FINDINGS — findings seen by exactly one reviewer. For each, assess plausibility strictly from the quoted evidence: unique insight, or noise?
+3. DISAGREEMENTS — anywhere reviewers contradict each other on severity, diagnosis, or fix. State each side's case.
+4. UNIFIED VERDICT — one go/no-go with a priority-ordered action list. Deduplicate; each action names the finding(s) it resolves and the reviewers behind it.
+
+Be concise and evidence-bound; cite reviewers by their review's name.
+
+TASK UNDER REVIEW:
+{task}
+
+{body}"""
+
+
 def invoke(
     name: str,
     cmd: list[str],
@@ -321,6 +345,19 @@ def parse_args() -> argparse.Namespace:
         default=Path("~/.hermes/skills/mirror-nodes"),
         help="Directory of mirror-node skill folders, each containing SKILL.md",
     )
+    parser.add_argument(
+        "--synthesize",
+        action="store_true",
+        help=("After all reviews complete, recombine them into one synthesis document "
+              "(03c-synthesis.md): convergence map, singular findings, disagreements, "
+              "unified verdict. The fix stage then follows the synthesis."),
+    )
+    parser.add_argument(
+        "--synthesize-backend",
+        choices=["hermes", "claude", "codex"],
+        default=None,
+        help="Backend for the synthesis stage (default: claude); passing this option enables synthesis",
+    )
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
@@ -348,8 +385,11 @@ def main() -> int:
             skill_file.read_text(encoding="utf-8") if mir_backend != "hermes" else None
         )
 
+    synth_enabled = args.synthesize or args.synthesize_backend is not None
+    synth_backend = args.synthesize_backend or "claude"
+
     executables = ["git", "codex", "claude"]
-    if mir_enabled and mir_backend == "hermes":
+    if (mir_enabled and mir_backend == "hermes") or (synth_enabled and synth_backend == "hermes"):
         executables.append("hermes")
         print(
             "warning: hermes >=0.18.2 ignores `-t \"\"` (and --skills force-enables its "
@@ -397,6 +437,8 @@ def main() -> int:
         "mir_enabled": mir_enabled,
         "mir_nodes": mir_nodes,
         "mir_backend": mir_backend if mir_enabled else None,
+        "synthesize": synth_enabled,
+        "synthesize_backend": synth_backend if synth_enabled else None,
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
@@ -510,17 +552,56 @@ def main() -> int:
             record_stage(stage_label, usage, time.monotonic() - started)
             reviews.append(mir_review)
 
+    synthesis = artifacts / "03c-synthesis.md"
+    if synth_enabled:
+        # Recombination: every review in, one convergence-weighted document out.
+        # The synthesizer sees only the review texts — no repo, no diff.
+        labeled = (
+            []
+            if args.dry_run
+            else [(p.name, p.read_text(encoding="utf-8")) for p in reviews if p.is_file()]
+        )
+        synth_prompt = build_synthesis_prompt(args.task, labeled)
+        stage_label = f"Synthesis ({synth_backend}): recombination"
+        synth_cmd, prompt_flag, parse_json = mirror_review_invocation(
+            synth_backend,
+            repo=repo,
+            output=synthesis,
+            node=None,
+            hermes_model=args.hermes_model,
+            claude_model=args.claude_model,
+            codex_model=args.codex_model,
+            max_budget_usd=args.max_budget_usd,
+        )
+        started = time.monotonic()
+        usage = invoke(
+            stage_label,
+            synth_cmd,
+            synth_prompt,
+            synthesis,
+            repo,
+            args.dry_run,
+            prompt_flag=prompt_flag,
+            timeout=args.stage_timeout_seconds,
+            parse_json=parse_json,
+        )
+        record_stage(stage_label, usage, time.monotonic() - started)
+
     if not args.skip_review_fix:
         texts = [] if args.dry_run else [p.read_text(encoding="utf-8") for p in reviews]
         if texts and all("NO ACTIONABLE FINDINGS" in t for t in texts):
             print("\n==> Codex: address review (skipped — all reviews reported no actionable findings)")
         else:
             review_refs = " and ".join(str(p) for p in reviews)
+            if synth_enabled:
+                fix_prompt = f"""Read the synthesis at {synthesis}, which recombines every review at {review_refs} into a convergence map and a priority-ordered action list. Work from the synthesis; consult the underlying reviews when you need a finding's full evidence. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push.\n\nTASK:\n{args.task}"""
+            else:
+                fix_prompt = f"""Read every review at {review_refs}. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push. If a review says NO ACTIONABLE FINDINGS, it requires no changes.\n\nTASK:\n{args.task}"""
             started = time.monotonic()
             usage = invoke(
                 "Codex: address review",
                 codex_cmd[:-2] + [str(fix_result), "-"],
-                f"""Read every review at {review_refs}. Verify every claim against the repository. Address all valid actionable findings for the task below, ignore unsupported suggestions, and run relevant tests. Do not commit or push. If a review says NO ACTIONABLE FINDINGS, it requires no changes.\n\nTASK:\n{args.task}""",
+                fix_prompt,
                 fix_result,
                 repo,
                 args.dry_run,
