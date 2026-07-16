@@ -33,6 +33,11 @@ CANONICAL_MIR_NODES = (
     "fael-mir",
 )
 
+# Inherited by agent subprocesses during a self-evolution run. This is private
+# orchestration state, not a user-facing generation counter: its presence means
+# the sole permitted generation is already active.
+SELF_EVOLUTION_ACTIVE_ENV = "CODEX_ORCHESTRATOR_SELF_EVOLUTION_ACTIVE"
+
 
 class TimedInvocationError(Exception):
     """Preserve a failed invocation's original error and elapsed duration."""
@@ -51,6 +56,7 @@ def run(
     stream: bool = False,
     timeout: float | None = None,
     return_stderr: bool = False,
+    env: dict[str, str] | None = None,
 ) -> str | tuple[str, str]:
     if stream:
         # Tee stdout to the console while collecting it; stderr inherits the
@@ -63,6 +69,7 @@ def run(
             stdout=subprocess.PIPE,
             text=True,
             start_new_session=timeout is not None,
+            env=env,
         )
         timed_out = threading.Event()
         timeout_lock = threading.Lock()
@@ -114,6 +121,7 @@ def run(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=timeout is not None,
+        env=env,
     )
     try:
         stdout, stderr = process.communicate(stdin, timeout=timeout)
@@ -455,6 +463,8 @@ def invoke(
     timeout: float | None = None,
     parse_json: bool = False,
     buffered: bool = False,
+    env: dict[str, str] | None = None,
+    protected_head: str | None = None,
 ) -> dict | None | tuple[dict | None, str]:
     if not buffered:
         print(f"\n==> {name}", flush=True)
@@ -471,14 +481,21 @@ def invoke(
             captured = run(
                 cmd + prompt_args, cwd=repo, stream=not buffered, timeout=timeout,
                 return_stderr=buffered,
+                env=env,
             )
         else:
             captured = run(
                 cmd, cwd=repo, stdin=prompt, stream=not buffered, timeout=timeout,
                 return_stderr=buffered,
+                env=env,
             )
     except TimeoutError:
         raise StageTimeoutError(f"Stage timed out after {timeout:g} seconds: {name}") from None
+    finally:
+        if protected_head is not None and git(repo, "rev-parse", "HEAD") != protected_head:
+            raise RuntimeError(
+                f"Human commit boundary violated during {name}: repository HEAD changed"
+            )
     if buffered:
         result, stderr = captured
     else:
@@ -616,6 +633,10 @@ def parse_args() -> argparse.Namespace:
     ):
         parser.error("--stage-timeout-seconds must be greater than zero")
     if args.self_evolve:
+        if SELF_EVOLUTION_ACTIVE_ENV in os.environ:
+            parser.error(
+                "--self-evolve cannot run recursively: a self-evolution generation is already active"
+            )
         conflicting = {
             "--repo", "--all-codex-mirror-formation", "--plan-backend",
             "--review-backend", "--mir", "--mir-backend", "--parallel-mirs",
@@ -649,6 +670,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     self_evolve = getattr(args, "self_evolve", False)
+    agent_env = None
+    if self_evolve:
+        agent_env = os.environ.copy()
+        agent_env[SELF_EVOLUTION_ACTIVE_ENV] = "1"
     all_codex = self_evolve or getattr(args, "all_codex_mirror_formation", False)
     plan_backend = "codex" if all_codex else getattr(args, "plan_backend", "claude")
     review_backend = "codex" if all_codex else getattr(args, "review_backend", "claude")
@@ -755,6 +780,11 @@ def main() -> int:
         "baseline": baseline,
         "self_evolution": self_evolve,
         "generation_limit": 1 if self_evolve else None,
+        "human_git_boundary": ({
+            "sandbox": "workspace-write",
+            "network_access": False,
+            "head_verification": True,
+        } if self_evolve else None),
         "all_codex_mirror_formation": all_codex,
         "plan_backend": plan_backend,
         "review_backend": review_backend,
@@ -808,6 +838,8 @@ def main() -> int:
             "codex", "exec", "-C", str(repo), "--sandbox", "read-only",
             "--color", "never", "--output-last-message", str(output), "-",
         ]
+        if self_evolve:
+            command[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
         if model:
             command[2:2] = ["--model", model]
         return command, False
@@ -821,6 +853,8 @@ def main() -> int:
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
         "--color", "never", "--output-last-message", str(codex_result), "-",
     ]
+    if self_evolve:
+        codex_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
     if stage_models["implement"]:
         codex_cmd[2:2] = ["--model", stage_models["implement"]]
 
@@ -828,6 +862,8 @@ def main() -> int:
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
         "--color", "never", "--output-last-message", str(fix_result), "-",
     ]
+    if self_evolve:
+        fix_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
     if stage_models["fix"]:
         fix_cmd[2:2] = ["--model", stage_models["fix"]]
 
@@ -842,6 +878,8 @@ def main() -> int:
         args.dry_run,
         timeout=args.stage_timeout_seconds,
         parse_json=plan_parse_json,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
     )
     record_stage(f"{plan_backend.title()}: plan", usage, time.monotonic() - started)
 
@@ -854,6 +892,8 @@ def main() -> int:
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
     )
     record_stage("Codex: implement", usage, time.monotonic() - started)
 
@@ -867,6 +907,8 @@ def main() -> int:
         args.dry_run,
         timeout=args.stage_timeout_seconds,
         parse_json=review_parse_json,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
     )
     record_stage(f"{review_backend.title()}: review", usage, time.monotonic() - started)
 
@@ -897,6 +939,8 @@ def main() -> int:
                 codex_model=stage_models["mir"] if mir_backend == "codex" else None,
                 max_budget_usd=args.max_budget_usd,
             )
+            if self_evolve:
+                mir_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
             mirror_jobs.append((stage_label, mir_review, mir_cmd, prompt_flag, parse_json, mir_prompt))
 
         if all_codex or args.parallel_mirs:
@@ -910,6 +954,8 @@ def main() -> int:
                         invoke_timed, stage_label, mir_cmd, mir_prompt, mir_review, repo, args.dry_run,
                         prompt_flag=prompt_flag, timeout=args.stage_timeout_seconds,
                         parse_json=parse_json, buffered=True,
+                        env=agent_env,
+                        protected_head=baseline if self_evolve and not args.dry_run else None,
                     )
                     futures[future] = (job_index, stage_label, mir_review)
                 for future in as_completed(futures):
@@ -980,6 +1026,8 @@ def main() -> int:
                     prompt_flag=prompt_flag,
                     timeout=args.stage_timeout_seconds,
                     parse_json=parse_json,
+                    env=agent_env,
+                    protected_head=baseline if self_evolve and not args.dry_run else None,
                 )
                 duration = time.monotonic() - started
                 tainted = False
@@ -1033,6 +1081,8 @@ def main() -> int:
             codex_model=(stage_models["synthesize"] if synth_backend == "codex" else None),
             max_budget_usd=args.max_budget_usd,
         )
+        if self_evolve:
+            synth_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
         synth_before = None if args.dry_run else tree_fingerprint(repo, baseline)
         started = time.monotonic()
         usage = invoke(
@@ -1045,6 +1095,8 @@ def main() -> int:
             prompt_flag=prompt_flag,
             timeout=args.stage_timeout_seconds,
             parse_json=parse_json,
+            env=agent_env,
+            protected_head=baseline if self_evolve and not args.dry_run else None,
         )
         duration = time.monotonic() - started
         if not args.dry_run:
@@ -1111,6 +1163,8 @@ def main() -> int:
                 repo,
                 args.dry_run,
                 timeout=args.stage_timeout_seconds,
+                env=agent_env,
+                protected_head=baseline if self_evolve and not args.dry_run else None,
             )
             record_stage("Codex: address review", usage, time.monotonic() - started)
 

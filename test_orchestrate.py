@@ -15,6 +15,7 @@ from orchestrate import (
     CANONICAL_MIR_NODES,
     LINEAGE_CAP,
     SYNTHESIS_CAP,
+    SELF_EVOLUTION_ACTIVE_ENV,
     TimedInvocationError,
     build_lineage_block,
     build_mir_prompt,
@@ -322,6 +323,20 @@ class ExtractResultAndUsageTests(unittest.TestCase):
 
 
 class InvokeTests(unittest.TestCase):
+    def test_protected_head_rejects_agent_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "result.md"
+            with (
+                patch("orchestrate.run", return_value="complete\n"),
+                patch("orchestrate.git", return_value="changed-head"),
+                self.assertRaisesRegex(RuntimeError, "Human commit boundary violated"),
+            ):
+                invoke(
+                    "agent", ["tool"], "prompt", output, root, False,
+                    protected_head="baseline",
+                )
+
     def test_dry_run_returns_null_usage_and_writes_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -465,6 +480,19 @@ class MirrorPureLogicTests(unittest.TestCase):
             ):
                 parse_args()
 
+    def test_self_evolve_rejects_nested_generation_marker(self) -> None:
+        for marker_value in ("1", ""):
+            with (
+                self.subTest(marker_value=marker_value),
+                patch.dict("os.environ", {SELF_EVOLUTION_ACTIVE_ENV: marker_value}),
+                patch.object(sys, "argv", ["orchestrate.py", "--self-evolve", "task"]),
+                self.assertRaises(SystemExit),
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", io.StringIO()) as stderr,
+            ):
+                parse_args()
+            self.assertIn("already active", stderr.getvalue())
+
     def test_all_codex_preset_expands_canonical_formation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -546,6 +574,111 @@ class MirrorPureLogicTests(unittest.TestCase):
                 stages.index(mir_stage_label("codex", node)) < synthesis_index
                 for node in CANONICAL_MIR_NODES
             ))
+
+    def test_self_evolve_runs_one_complete_marked_generation_with_newest_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_dir = root / ".git"
+            runs = git_dir / "agent-collab" / "runs"
+            for run_id, text in (("20260101-000000", "older"), ("20260102-000000", "newest")):
+                run = runs / run_id
+                run.mkdir(parents=True)
+                (run / "03c-synthesis.md").write_text(text, encoding="utf-8")
+            skills_dir = root / "skills"
+            for node in (*CANONICAL_MIR_NODES, "om-mir"):
+                skill = skills_dir / node / "SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text(f"{node} lens", encoding="utf-8")
+            args = namespace(
+                repo=root / "ignored-caller-repo", mir_skills_dir=skills_dir,
+                self_evolve=True, dry_run=False,
+            )
+            git_calls = []
+
+            def fake_git(repo: Path, *git_args: str) -> str:
+                git_calls.append((repo, git_args))
+                return {
+                    ("rev-parse", "--show-toplevel"): str(root),
+                    ("rev-parse", "--path-format=absolute", "--git-dir"): str(git_dir),
+                    ("rev-parse", "HEAD"): "baseline",
+                    ("status", "--porcelain"): "",
+                    ("status", "--short"): "",
+                }[git_args]
+
+            invocations = []
+            barrier = threading.Barrier(len(CANONICAL_MIR_NODES))
+
+            def fake_invoke(*call_args, **kwargs):
+                invocations.append((call_args, kwargs))
+                if call_args[0].startswith("Mir ("):
+                    barrier.wait(timeout=2)
+                call_args[3].write_text("SEAL: FINDINGS 1\n", encoding="utf-8")
+                return (None, "complete\n") if kwargs.get("buffered") else None
+
+            with (
+                patch("orchestrate.parse_args", return_value=args),
+                patch("orchestrate.shutil.which", return_value="/bin/tool"),
+                patch("orchestrate.git", side_effect=fake_git),
+                patch("orchestrate.complete_diff", return_value="frozen diff"),
+                patch("orchestrate.tree_fingerprint", return_value="still"),
+                patch("orchestrate.invoke", side_effect=fake_invoke),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(), 0)
+
+            self.assertEqual(git_calls[0][0], Path(__file__).resolve().parent)
+            self.assertNotEqual(git_calls[0][0], args.repo)
+            artifacts = max(path for path in runs.iterdir() if path.name.startswith("20"))
+            metadata = json.loads((artifacts / "run.json").read_text())
+            self.assertTrue(metadata["self_evolution"])
+            self.assertEqual(metadata["generation_limit"], 1)
+            self.assertEqual(metadata["human_git_boundary"], {
+                "sandbox": "workspace-write",
+                "network_access": False,
+                "head_verification": True,
+            })
+            self.assertEqual(metadata["lineage"], ["20260102-000000"])
+            self.assertEqual(metadata["mir_nodes"], list(CANONICAL_MIR_NODES))
+            self.assertTrue(metadata["parallel_mirs"])
+            self.assertEqual(
+                {metadata[key] for key in (
+                    "plan_backend", "review_backend", "mir_backend", "synthesize_backend",
+                )},
+                {"codex"},
+            )
+            self.assertFalse(metadata["usage"].get("Claude: plan"))
+
+            calls_by_stage = {call_args[0]: (call_args, kwargs) for call_args, kwargs in invocations}
+            plan_prompt = calls_by_stage["Codex: plan"][0][2]
+            self.assertIn("newest", plan_prompt)
+            self.assertNotIn("older", plan_prompt)
+            for call_args, kwargs in invocations:
+                self.assertEqual(kwargs["env"][SELF_EVOLUTION_ACTIVE_ENV], "1")
+                self.assertEqual(kwargs["protected_head"], "baseline")
+                command = call_args[1]
+                self.assertIn("sandbox_workspace_write.network_access=false", command)
+            stages = [call_args[0] for call_args, _ in invocations]
+            synthesis_index = stages.index("Synthesis (codex, om-mir): recombination")
+            self.assertTrue(all(
+                stages.index(mir_stage_label("codex", node)) < synthesis_index
+                for node in CANONICAL_MIR_NODES
+            ))
+            self.assertIn("Codex: address review", calls_by_stage)
+            for stage in ("Codex: implement", "Codex: address review"):
+                prompt = calls_by_stage[stage][0][2].lower()
+                self.assertIn("do not commit", prompt)
+                self.assertIn("push", prompt)
+
+    def test_self_evolve_rejects_dirty_repository(self) -> None:
+        args = namespace(self_evolve=True)
+        with (
+            patch("orchestrate.parse_args", return_value=args),
+            patch("orchestrate.shutil.which", return_value="/bin/tool"),
+            patch("orchestrate.resolve_mir_skill", return_value=Path(__file__)),
+            patch("orchestrate.git", side_effect=[str(Path(__file__).resolve().parent), "dirty"]),
+            self.assertRaisesRegex(RuntimeError, "uncommitted changes"),
+        ):
+            main()
 
     def test_stage_models_use_backend_defaults_and_independent_overrides(self) -> None:
         defaults = select_stage_models(
