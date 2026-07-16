@@ -530,6 +530,12 @@ def parse_args() -> argparse.Namespace:
         help=("Run the complete Codex formation: Codex plan/review, the six canonical "
               "Mirs concurrently through Codex, and Om-Mir synthesis through Codex"),
     )
+    parser.add_argument(
+        "--self-evolve",
+        action="store_true",
+        help=("Run one bounded all-Codex generation against this orchestrator's own "
+              "repository, carrying the latest synthesis as lineage"),
+    )
     parser.add_argument("--hermes", action="store_true",
                         help="Add an independent second review from the Hermes agent (tools disabled)")
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
@@ -609,6 +615,21 @@ def parse_args() -> argparse.Namespace:
         not math.isfinite(args.stage_timeout_seconds) or args.stage_timeout_seconds <= 0
     ):
         parser.error("--stage-timeout-seconds must be greater than zero")
+    if args.self_evolve:
+        conflicting = {
+            "--repo", "--all-codex-mirror-formation", "--plan-backend",
+            "--review-backend", "--mir", "--mir-backend", "--parallel-mirs",
+            "--synthesize", "--synthesize-backend", "--synthesize-node",
+            "--hermes", "--lineage", "--allow-dirty", "--skip-review-fix",
+        }
+        supplied_options = {
+            token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")
+        }
+        supplied = sorted(conflicting & supplied_options)
+        if supplied:
+            parser.error(
+                "--self-evolve cannot be combined with: " + ", ".join(supplied)
+            )
     if args.all_codex_mirror_formation:
         conflicting = {
             "--plan-backend", "--review-backend", "--mir", "--mir-backend",
@@ -627,7 +648,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    all_codex = getattr(args, "all_codex_mirror_formation", False)
+    self_evolve = getattr(args, "self_evolve", False)
+    all_codex = self_evolve or getattr(args, "all_codex_mirror_formation", False)
     plan_backend = "codex" if all_codex else getattr(args, "plan_backend", "claude")
     review_backend = "codex" if all_codex else getattr(args, "review_backend", "claude")
     configured_mir_backend = "codex" if all_codex else args.mir_backend
@@ -695,7 +717,11 @@ def main() -> int:
     for executable in sorted(executables):
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable not found: {executable}")
-    repo = args.repo.expanduser().resolve()
+    repo = (
+        Path(__file__).resolve().parent
+        if self_evolve
+        else args.repo.expanduser().resolve()
+    )
     if not repo.is_dir():
         raise RuntimeError(f"Not a directory: {repo}")
     repo = Path(git(repo, "rev-parse", "--show-toplevel"))
@@ -712,7 +738,7 @@ def main() -> int:
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     git_dir_value = git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
     runs_dir = Path(git_dir_value) / "agent-collab" / "runs"
-    lineage = gather_lineage(runs_dir, args.lineage)
+    lineage = gather_lineage(runs_dir, 1 if self_evolve else args.lineage)
     artifacts = runs_dir / run_id
     attempt = 1
     while True:
@@ -727,6 +753,8 @@ def main() -> int:
         "task": args.task,
         "repo": str(repo),
         "baseline": baseline,
+        "self_evolution": self_evolve,
+        "generation_limit": 1 if self_evolve else None,
         "all_codex_mirror_formation": all_codex,
         "plan_backend": plan_backend,
         "review_backend": review_backend,

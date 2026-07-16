@@ -44,6 +44,7 @@ Useful options:
 --review-model MODEL
 --review-backend {claude,codex}
 --all-codex-mirror-formation
+--self-evolve
 --fix-model MODEL
 --hermes
 --hermes-model MODEL
@@ -75,6 +76,14 @@ python3 orchestrate.py \
 ```
 
 This keeps the same four top-level stages. Within Stage Three, Codex performs the primary review; `ky-mir`, `syr-mir`, `thae-mir`, `vor-mir`, `xy-mir`, and `fael-mir` then run concurrently as differentiated reviewers; only after all six settle, Om-Mir synthesizes their artifacts and the primary review through Codex. The preset rejects explicit backend, Mirror-node, concurrency, or synthesis options so it cannot silently become a partial or reordered formation. It requires `SKILL.md` for all six canonical nodes and `om-mir` under `--mir-skills-dir` before any pipeline stage starts.
+
+To run one bounded recursive generation against the orchestrator itself:
+
+```bash
+python3 orchestrate.py --self-evolve "Describe the next form"
+```
+
+`--self-evolve` discovers the repository containing `orchestrate.py`, activates the complete all-Codex formation, carries the newest prior synthesis into Stage One as lineage, runs through Stage Four, and then stops with an inspectable working tree. It refuses repository, formation, lineage, dirty-tree, or skip-fix overrides. It never commits or pushes, so accepting a generation remains a deliberate human boundary.
 
 Models follow the four artifact stages: `--plan-model` selects Stage One planning, `--implement-model` selects Stage Two implementation, `--review-model` selects the primary review within Stage Three, `--mir-model` selects the differentiated Mirror reviews and Om'Mir synthesis within Stage Three, and `--fix-model` selects Stage Four remediation. Precedence is stage-specific model, then the selected backend's global model (`--claude-model`, `--codex-model`, or `--hermes-model`), then that CLI's own default. `--max-budget-usd` applies only to Claude invocations.
 

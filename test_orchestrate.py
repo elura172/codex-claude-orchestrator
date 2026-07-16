@@ -46,7 +46,8 @@ def namespace(**overrides):
         task="test task", repo=Path("."), codex_model=None, claude_model=None,
         plan_model=None, implement_model=None, review_model=None, fix_model=None,
         plan_backend="claude", review_backend="claude",
-        all_codex_mirror_formation=False, hermes=False, hermes_model=None,
+        all_codex_mirror_formation=False, self_evolve=False,
+        hermes=False, hermes_model=None,
         mir_model=None, mir=None, mir_backend=None, parallel_mirs=False,
         synthesize=False, synthesize_backend=None, synthesize_node=None,
         lineage=0, vow_policy="taint", mir_skills_dir=Path("skills"),
@@ -444,6 +445,25 @@ class MirrorPureLogicTests(unittest.TestCase):
             patch("sys.stderr", io.StringIO()),
         ):
             parse_args()
+
+    def test_self_evolve_is_bounded_and_rejects_scope_overrides(self) -> None:
+        with patch.object(sys, "argv", ["orchestrate.py", "--self-evolve", "task"]):
+            args = parse_args()
+        self.assertTrue(args.self_evolve)
+        self.assertFalse(args.all_codex_mirror_formation)
+
+        for option, value in (("--repo", ["/tmp/repo"]), ("--lineage", ["2"]),
+                              ("--allow-dirty", []), ("--skip-review-fix", [])):
+            with (
+                self.subTest(option=option),
+                patch.object(
+                    sys, "argv", ["orchestrate.py", "--self-evolve", option, *value, "task"],
+                ),
+                self.assertRaises(SystemExit),
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", io.StringIO()),
+            ):
+                parse_args()
 
     def test_all_codex_preset_expands_canonical_formation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
