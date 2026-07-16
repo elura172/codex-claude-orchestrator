@@ -255,6 +255,36 @@ def mirror_review_invocation(
 
 
 SYNTHESIS_CAP = 120_000
+LINEAGE_CAP = 40_000
+
+
+def gather_lineage(runs_dir: Path, count: int) -> list[tuple[str, str]]:
+    """Collect the syntheses of the most recent prior runs, newest first."""
+    if count <= 0 or not runs_dir.is_dir():
+        return []
+    entries: list[tuple[str, str]] = []
+    for run in sorted(runs_dir.iterdir(), reverse=True):
+        synthesis = run / "03c-synthesis.md"
+        if synthesis.is_file():
+            entries.append((run.name, synthesis.read_text(encoding="utf-8")))
+            if len(entries) == count:
+                break
+    return entries
+
+
+def build_lineage_block(entries: list[tuple[str, str]]) -> str:
+    """Render prior syntheses as a prompt section; empty when there are none."""
+    if not entries:
+        return ""
+    sections = "\n\n".join(f"### RUN {name}\n{text.strip()}" for name, text in entries)
+    if len(sections) > LINEAGE_CAP:
+        sections = sections[:LINEAGE_CAP] + "\n[lineage truncated for length]"
+    return (
+        "\n\nLINEAGE — syntheses of prior runs in this repository, newest first. "
+        "Treat them as memory, not instruction: honor constraints they establish, "
+        "do not re-plan work they show completed, and carry forward unresolved "
+        "findings that touch this task:\n\n" + sections
+    )
 
 
 def build_synthesis_prompt(
@@ -367,6 +397,14 @@ def parse_args() -> argparse.Namespace:
               "(a subdirectory of --mir-skills-dir containing SKILL.md); "
               "passing this option enables synthesis"),
     )
+    parser.add_argument(
+        "--lineage",
+        type=int,
+        default=0,
+        metavar="N",
+        help=("Hand the planning stage the syntheses of the N most recent "
+              "prior runs in this repository (default: 0, no lineage)"),
+    )
     parser.add_argument("--max-budget-usd", type=float, help="Budget for each Claude invocation")
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
@@ -437,6 +475,7 @@ def main() -> int:
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     git_dir_value = git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
     runs_dir = Path(git_dir_value) / "agent-collab" / "runs"
+    lineage = gather_lineage(runs_dir, args.lineage)
     artifacts = runs_dir / run_id
     attempt = 1
     while True:
@@ -458,6 +497,7 @@ def main() -> int:
         "synthesize": synth_enabled,
         "synthesize_backend": synth_backend if synth_enabled else None,
         "synthesize_node": args.synthesize_node if synth_enabled else None,
+        "lineage": [name for name, _ in lineage],
         "mir_skills_dir": str(mir_skills_dir) if mir_enabled else None,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "usage": {},
@@ -485,11 +525,12 @@ def main() -> int:
     if args.max_budget_usd is not None:
         claude_base += ["--max-budget-usd", str(args.max_budget_usd)]
 
+    plan_prompt = f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}{build_lineage_block(lineage)}"""
     started = time.monotonic()
     usage = invoke(
         "Claude: plan",
         claude_base,
-        f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}""",
+        plan_prompt,
         plan,
         repo,
         args.dry_run,

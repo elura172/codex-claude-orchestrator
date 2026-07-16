@@ -8,10 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrate import (
+    LINEAGE_CAP,
     SYNTHESIS_CAP,
+    build_lineage_block,
     build_summary,
     build_synthesis_prompt,
     extract_result_and_usage,
+    gather_lineage,
     format_duration,
     invoke,
     main,
@@ -47,6 +50,46 @@ class SynthesisPromptTests(unittest.TestCase):
         prompt = build_synthesis_prompt("t", [("big.md", "x" * (SYNTHESIS_CAP + 1000))])
         self.assertIn("[reviews truncated for length]", prompt)
         self.assertLess(len(prompt), SYNTHESIS_CAP + 2000)
+
+
+class LineageTests(unittest.TestCase):
+    def test_gathers_newest_first_and_skips_runs_without_synthesis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            for name, synthesis in [
+                ("20260101-000000", "oldest"),
+                ("20260102-000000", None),
+                ("20260103-000000", "middle"),
+                ("20260104-000000", "newest"),
+            ]:
+                run = runs / name
+                run.mkdir()
+                if synthesis is not None:
+                    (run / "03c-synthesis.md").write_text(synthesis, encoding="utf-8")
+
+            entries = gather_lineage(runs, 2)
+
+            self.assertEqual(
+                entries,
+                [("20260104-000000", "newest"), ("20260103-000000", "middle")],
+            )
+
+    def test_zero_count_and_missing_dir_return_empty(self) -> None:
+        self.assertEqual(gather_lineage(Path("/nonexistent"), 3), [])
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(gather_lineage(Path(directory), 0), [])
+
+    def test_block_labels_runs_and_is_empty_without_entries(self) -> None:
+        self.assertEqual(build_lineage_block([]), "")
+        block = build_lineage_block([("20260104-000000", "finding X")])
+        self.assertIn("LINEAGE", block)
+        self.assertIn("### RUN 20260104-000000", block)
+        self.assertIn("finding X", block)
+
+    def test_overlong_lineage_truncated(self) -> None:
+        block = build_lineage_block([("big", "x" * (LINEAGE_CAP + 1000))])
+        self.assertIn("[lineage truncated for length]", block)
+        self.assertLess(len(block), LINEAGE_CAP + 2000)
 
 
 class SummaryTests(unittest.TestCase):
@@ -105,6 +148,7 @@ class SummaryTests(unittest.TestCase):
                 task="test task", repo=repo, codex_model=None, claude_model=None,
                 hermes=False, hermes_model=None, mir=None, mir_backend=None,
                 synthesize=False, synthesize_backend=None, synthesize_node=None,
+                lineage=0,
                 mir_skills_dir=repo / "skills", max_budget_usd=None,
                 stage_timeout_seconds=None, allow_dirty=False,
                 skip_review_fix=False, dry_run=True,
