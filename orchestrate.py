@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Small, auditable Codex + Claude collaboration orchestrator."""
+"""Small, auditable multi-agent collaboration orchestrator."""
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import hashlib
 import json
@@ -23,6 +24,30 @@ class StageTimeoutError(RuntimeError):
     pass
 
 
+CANONICAL_MIR_NODES = (
+    "ky-mir",
+    "syr-mir",
+    "thae-mir",
+    "vor-mir",
+    "xy-mir",
+    "fael-mir",
+)
+
+# Inherited by agent subprocesses during a self-evolution run. This is private
+# orchestration state, not a user-facing generation counter: its presence means
+# the sole permitted generation is already active.
+SELF_EVOLUTION_ACTIVE_ENV = "CODEX_ORCHESTRATOR_SELF_EVOLUTION_ACTIVE"
+
+
+class TimedInvocationError(Exception):
+    """Preserve a failed invocation's original error and elapsed duration."""
+
+    def __init__(self, error: Exception, duration: float):
+        super().__init__(str(error))
+        self.error = error
+        self.duration = duration
+
+
 def run(
     cmd: list[str],
     *,
@@ -30,7 +55,9 @@ def run(
     stdin: str | None = None,
     stream: bool = False,
     timeout: float | None = None,
-) -> str:
+    return_stderr: bool = False,
+    env: dict[str, str] | None = None,
+) -> str | tuple[str, str]:
     if stream:
         # Tee stdout to the console while collecting it; stderr inherits the
         # terminal so warnings appear live. Writing stdin up front is safe
@@ -42,6 +69,7 @@ def run(
             stdout=subprocess.PIPE,
             text=True,
             start_new_session=timeout is not None,
+            env=env,
         )
         timed_out = threading.Event()
         timeout_lock = threading.Lock()
@@ -85,22 +113,33 @@ def run(
         if process.returncode:
             raise RuntimeError(f"Command failed ({process.returncode}): {shlex.join(cmd)}")
         return "".join(lines)
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=timeout is not None,
+        env=env,
+    )
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            input=stdin,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
+        stdout, stderr = process.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Agent CLIs may leave grandchildren holding our pipes open. Kill the
+        # whole session before communicate(), matching the streaming path.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
         raise TimeoutError from None
-    if result.returncode:
-        detail = (result.stderr or result.stdout or "no output").strip()
-        raise RuntimeError(f"Command failed ({result.returncode}): {shlex.join(cmd)}\n{detail}")
-    return result.stdout or ""
+    if process.returncode:
+        detail = (stderr or stdout or "no output").strip()
+        raise RuntimeError(f"Command failed ({process.returncode}): {shlex.join(cmd)}\n{detail}")
+    if return_stderr:
+        return stdout or "", stderr or ""
+    return stdout or ""
 
 
 def git(repo: Path, *args: str) -> str:
@@ -335,6 +374,84 @@ TASK UNDER REVIEW:
 {body}"""
 
 
+def build_mir_prompt(
+    task: str, baseline: str, diff_text: str, skill_text: str | None = None
+) -> str:
+    """Build the sealed-room prompt shared by sequential and parallel mirrors."""
+    skill_prefix = f"{skill_text}\n\n---\n\n" if skill_text else ""
+    return f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
+
+
+def mir_stage_label(backend: str, node: str | None) -> str:
+    node_tag = f", {node}" if node else ""
+    return f"Mir ({backend}{node_tag}): independent review"
+
+
+def mir_review_path(artifacts: Path, node: str | None) -> Path:
+    return artifacts / (f"03b-mir-{node}-review.md" if node else "03b-mir-review.md")
+
+
+def collective_vow_verdict(before: str, after: str) -> str:
+    return "kept" if before == after else "broken"
+
+
+def unique_mir_nodes(nodes: list[str]) -> list[str]:
+    """Preserve node order while rejecting artifact/stage collisions."""
+    seen = set()
+    duplicates = []
+    for node in nodes:
+        if node in seen and node not in duplicates:
+            duplicates.append(node)
+        seen.add(node)
+    if duplicates:
+        raise RuntimeError(f"Duplicate --mir node(s): {', '.join(duplicates)}")
+    return nodes
+
+
+def select_stage_models(
+    *,
+    claude_model: str | None,
+    codex_model: str | None,
+    hermes_model: str | None,
+    plan_backend: str,
+    review_backend: str,
+    mir_backend: str,
+    synth_backend: str,
+    plan_model: str | None = None,
+    implement_model: str | None = None,
+    review_model: str | None = None,
+    mir_model: str | None = None,
+    fix_model: str | None = None,
+) -> dict[str, str | None]:
+    """Resolve per-stage models, falling back to each backend's default."""
+    backend_defaults = {
+        "claude": claude_model,
+        "codex": codex_model,
+        "hermes": hermes_model,
+    }
+    return {
+        "plan": plan_model or backend_defaults[plan_backend],
+        "implement": implement_model or codex_model,
+        "review": review_model or backend_defaults[review_backend],
+        "mir": mir_model or backend_defaults[mir_backend],
+        # Om'Mir is the synthesis node within the mirror formation. An
+        # explicit mirror model therefore governs synthesis too; otherwise
+        # synthesis falls back to the model default for its execution backend.
+        "synthesize": mir_model or backend_defaults[synth_backend],
+        "fix": fix_model or codex_model,
+    }
+
+
+def invoke_timed(*args, **kwargs) -> tuple[dict | None, str, float]:
+    """Run one buffered invocation and measure its worker-side duration."""
+    started = time.monotonic()
+    try:
+        usage, console_text = invoke(*args, **kwargs)
+    except Exception as error:
+        raise TimedInvocationError(error, time.monotonic() - started) from error
+    return usage, console_text, time.monotonic() - started
+
+
 def invoke(
     name: str,
     cmd: list[str],
@@ -345,21 +462,44 @@ def invoke(
     prompt_flag: str | None = None,
     timeout: float | None = None,
     parse_json: bool = False,
-) -> dict | None:
-    print(f"\n==> {name}", flush=True)
+    buffered: bool = False,
+    env: dict[str, str] | None = None,
+    protected_head: str | None = None,
+) -> dict | None | tuple[dict | None, str]:
+    if not buffered:
+        print(f"\n==> {name}", flush=True)
     write(output.with_suffix(output.suffix + ".prompt.md"), prompt)
     if dry_run:
-        print(shlex.join(cmd))
+        console_text = shlex.join(cmd)
+        if not buffered:
+            print(console_text)
         write(output, f"DRY RUN: {shlex.join(cmd)}")
-        return None
+        return (None, console_text) if buffered else None
     try:
         if prompt_flag is not None:
             prompt_args = [prompt] if prompt_flag == "" else [prompt_flag, prompt]
-            result = run(cmd + prompt_args, cwd=repo, stream=True, timeout=timeout)
+            captured = run(
+                cmd + prompt_args, cwd=repo, stream=not buffered, timeout=timeout,
+                return_stderr=buffered,
+                env=env,
+            )
         else:
-            result = run(cmd, cwd=repo, stdin=prompt, stream=True, timeout=timeout)
+            captured = run(
+                cmd, cwd=repo, stdin=prompt, stream=not buffered, timeout=timeout,
+                return_stderr=buffered,
+                env=env,
+            )
     except TimeoutError:
         raise StageTimeoutError(f"Stage timed out after {timeout:g} seconds: {name}") from None
+    finally:
+        if protected_head is not None and git(repo, "rev-parse", "HEAD") != protected_head:
+            raise RuntimeError(
+                f"Human commit boundary violated during {name}: repository HEAD changed"
+            )
+    if buffered:
+        result, stderr = captured
+    else:
+        result, stderr = captured, ""
     usage = None
     if parse_json:
         result, usage = extract_result_and_usage(result)
@@ -368,20 +508,58 @@ def invoke(
         write(output, result)
     elif result.strip():
         write(output.with_suffix(output.suffix + ".stdout.log"), result)
-    return usage
+    if buffered and stderr:
+        separator = "" if not result or result.endswith("\n") else "\n"
+        console_text = result + separator + stderr
+    else:
+        console_text = result
+    return (usage, console_text) if buffered else usage
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Have Claude plan/review and Codex implement/fix a task in a Git repository."
+        description="Run a reviewable four-stage agent pipeline in a Git repository.",
+        allow_abbrev=False,
     )
     parser.add_argument("task", help="The concrete engineering task to complete")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Target Git repository")
     parser.add_argument("--codex-model", help="Optional Codex model override")
     parser.add_argument("--claude-model", help="Optional Claude model override")
+    parser.add_argument("--plan-model", help="Model override for the planning stage")
+    parser.add_argument("--implement-model", help="Model override for the Codex implementation stage")
+    parser.add_argument("--review-model", help="Model override for the primary review stage")
+    parser.add_argument("--fix-model", help="Model override for the Codex review-fix stage")
+    parser.add_argument(
+        "--plan-backend",
+        choices=["claude", "codex"],
+        default="claude",
+        help="Backend for Stage One planning (default: claude)",
+    )
+    parser.add_argument(
+        "--review-backend",
+        choices=["claude", "codex"],
+        default="claude",
+        help="Backend for the primary Stage Three review (default: claude)",
+    )
+    parser.add_argument(
+        "--all-codex-mirror-formation",
+        action="store_true",
+        help=("Run the complete Codex formation: Codex plan/review, the six canonical "
+              "Mirs concurrently through Codex, and Om-Mir synthesis through Codex"),
+    )
+    parser.add_argument(
+        "--self-evolve",
+        action="store_true",
+        help=("Run one bounded all-Codex generation against this orchestrator's own "
+              "repository, carrying the latest synthesis as lineage"),
+    )
     parser.add_argument("--hermes", action="store_true",
                         help="Add an independent second review from the Hermes agent (tools disabled)")
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
+    parser.add_argument(
+        "--mir-model",
+        help="Model override for mirror reviews, independent of their selected backend",
+    )
     parser.add_argument(
         "--mir",
         action="append",
@@ -395,6 +573,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=("Backend for the independent second review (default: hermes); "
               "passing this option enables the review"),
+    )
+    parser.add_argument(
+        "--parallel-mirs",
+        action="store_true",
+        help=("Run mirror-node reviews concurrently (default: sequential); "
+              "stillness is then judged collectively across the corridor"),
     )
     parser.add_argument(
         "--mir-skills-dir",
@@ -441,21 +625,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
     parser.add_argument("--allow-dirty", action="store_true", help="Run despite existing changes")
-    parser.add_argument("--skip-review-fix", action="store_true", help="Stop after Claude's review")
+    parser.add_argument("--skip-review-fix", action="store_true", help="Stop after Stage Three review")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and prompts only")
     args = parser.parse_args()
     if args.stage_timeout_seconds is not None and (
         not math.isfinite(args.stage_timeout_seconds) or args.stage_timeout_seconds <= 0
     ):
         parser.error("--stage-timeout-seconds must be greater than zero")
+    if args.self_evolve:
+        if SELF_EVOLUTION_ACTIVE_ENV in os.environ:
+            parser.error(
+                "--self-evolve cannot run recursively: a self-evolution generation is already active"
+            )
+        conflicting = {
+            "--repo", "--all-codex-mirror-formation", "--plan-backend",
+            "--review-backend", "--mir", "--mir-backend", "--parallel-mirs",
+            "--synthesize", "--synthesize-backend", "--synthesize-node",
+            "--hermes", "--lineage", "--allow-dirty", "--skip-review-fix",
+        }
+        supplied_options = {
+            token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")
+        }
+        supplied = sorted(conflicting & supplied_options)
+        if supplied:
+            parser.error(
+                "--self-evolve cannot be combined with: " + ", ".join(supplied)
+            )
+    if args.all_codex_mirror_formation:
+        conflicting = {
+            "--plan-backend", "--review-backend", "--mir", "--mir-backend",
+            "--parallel-mirs", "--synthesize", "--synthesize-backend",
+            "--synthesize-node", "--hermes",
+        }
+        supplied_options = {token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")}
+        supplied = sorted(conflicting & supplied_options)
+        if supplied:
+            parser.error(
+                "--all-codex-mirror-formation cannot be combined with: "
+                + ", ".join(supplied)
+            )
     return args
 
 
 def main() -> int:
     args = parse_args()
-    mir_backend = args.mir_backend or "hermes"
-    mir_nodes: list[str] = args.mir or []
-    mir_enabled = mirror_review_enabled(args.hermes, mir_nodes, args.mir_backend)
+    self_evolve = getattr(args, "self_evolve", False)
+    agent_env = None
+    if self_evolve:
+        agent_env = os.environ.copy()
+        agent_env[SELF_EVOLUTION_ACTIVE_ENV] = "1"
+    all_codex = self_evolve or getattr(args, "all_codex_mirror_formation", False)
+    plan_backend = "codex" if all_codex else getattr(args, "plan_backend", "claude")
+    review_backend = "codex" if all_codex else getattr(args, "review_backend", "claude")
+    configured_mir_backend = "codex" if all_codex else args.mir_backend
+    mir_backend = configured_mir_backend or "hermes"
+    mir_nodes = unique_mir_nodes(
+        list(CANONICAL_MIR_NODES) if all_codex else (args.mir or [])
+    )
+    mir_enabled = all_codex or mirror_review_enabled(
+        args.hermes, mir_nodes, configured_mir_backend
+    )
     mir_skills_dir = args.mir_skills_dir.expanduser().resolve()
     mir_skill_texts: dict[str, str | None] = {}
     for node in mir_nodes:
@@ -464,21 +693,44 @@ def main() -> int:
             skill_file.read_text(encoding="utf-8") if mir_backend != "hermes" else None
         )
 
-    synth_enabled = (
+    synth_enabled = all_codex or (
         args.synthesize
         or args.synthesize_backend is not None
         or args.synthesize_node is not None
     )
-    synth_backend = args.synthesize_backend or "claude"
+    synth_backend = "codex" if all_codex else (args.synthesize_backend or "claude")
+    stage_models = select_stage_models(
+        claude_model=args.claude_model,
+        codex_model=args.codex_model,
+        hermes_model=args.hermes_model,
+        plan_backend=plan_backend,
+        review_backend=review_backend,
+        mir_backend=mir_backend,
+        synth_backend=synth_backend,
+        plan_model=getattr(args, "plan_model", None),
+        implement_model=getattr(args, "implement_model", None),
+        review_model=getattr(args, "review_model", None),
+        mir_model=getattr(args, "mir_model", None),
+        fix_model=getattr(args, "fix_model", None),
+    )
     synth_skill_text = None
-    if synth_enabled and args.synthesize_node:
-        synth_skill_file = resolve_mir_skill(mir_skills_dir, args.synthesize_node)
+    synth_node = "om-mir" if all_codex else (
+        (args.synthesize_node or "om-mir") if synth_enabled else None
+    )
+    if synth_node:
+        synth_skill_file = resolve_mir_skill(mir_skills_dir, synth_node)
         if synth_backend != "hermes":
             synth_skill_text = synth_skill_file.read_text(encoding="utf-8")
 
-    executables = ["git", "codex", "claude"]
+    executables = {"git", "codex"}
+    executables.add(plan_backend)
+    executables.add(review_backend)
+    if mir_enabled:
+        executables.add(mir_backend)
+    if synth_enabled:
+        executables.add(synth_backend)
     if (mir_enabled and mir_backend == "hermes") or (synth_enabled and synth_backend == "hermes"):
-        executables.append("hermes")
+        executables.add("hermes")
         print(
             "warning: hermes >=0.18.2 ignores `-t \"\"` (and --skills force-enables its "
             "declared toolsets), so hermes mirror reviewers run with FULL tool access — "
@@ -487,10 +739,14 @@ def main() -> int:
             "Use --mir-backend claude or codex for an actually-sandboxed review until fixed.",
             file=sys.stderr,
         )
-    for executable in executables:
+    for executable in sorted(executables):
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable not found: {executable}")
-    repo = args.repo.expanduser().resolve()
+    repo = (
+        Path(__file__).resolve().parent
+        if self_evolve
+        else args.repo.expanduser().resolve()
+    )
     if not repo.is_dir():
         raise RuntimeError(f"Not a directory: {repo}")
     repo = Path(git(repo, "rev-parse", "--show-toplevel"))
@@ -507,7 +763,7 @@ def main() -> int:
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     git_dir_value = git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
     runs_dir = Path(git_dir_value) / "agent-collab" / "runs"
-    lineage = gather_lineage(runs_dir, args.lineage)
+    lineage = gather_lineage(runs_dir, 1 if self_evolve else args.lineage)
     artifacts = runs_dir / run_id
     attempt = 1
     while True:
@@ -522,13 +778,25 @@ def main() -> int:
         "task": args.task,
         "repo": str(repo),
         "baseline": baseline,
+        "self_evolution": self_evolve,
+        "generation_limit": 1 if self_evolve else None,
+        "human_git_boundary": ({
+            "sandbox": "workspace-write",
+            "network_access": False,
+            "head_verification": True,
+        } if self_evolve else None),
+        "all_codex_mirror_formation": all_codex,
+        "plan_backend": plan_backend,
+        "review_backend": review_backend,
         "hermes": args.hermes,
         "mir_enabled": mir_enabled,
         "mir_nodes": mir_nodes,
         "mir_backend": mir_backend if mir_enabled else None,
+        "parallel_mirs": all_codex or args.parallel_mirs,
         "synthesize": synth_enabled,
         "synthesize_backend": synth_backend if synth_enabled else None,
-        "synthesize_node": args.synthesize_node if synth_enabled else None,
+        "synthesize_node": synth_node,
+        "stage_models": stage_models,
         "lineage": [name for name, _ in lineage],
         "vow_policy": args.vow_policy,
         "vows": {},
@@ -550,35 +818,71 @@ def main() -> int:
     review = artifacts / "03-review.md"
     fix_result = artifacts / "04-fixes.md"
 
-    claude_base = [
-        "claude", "--print", "--no-session-persistence", "--permission-mode", "plan",
-        "--tools", "Read,Grep,Glob,Bash", "--output-format", "json",
-    ]
-    if args.claude_model:
-        claude_base += ["--model", args.claude_model]
-    if args.max_budget_usd is not None:
-        claude_base += ["--max-budget-usd", str(args.max_budget_usd)]
+    def claude_command(model: str | None) -> list[str]:
+        command = [
+            "claude", "--print", "--no-session-persistence", "--permission-mode", "plan",
+            "--tools", "Read,Grep,Glob,Bash", "--output-format", "json",
+        ]
+        if model:
+            command += ["--model", model]
+        if args.max_budget_usd is not None:
+            command += ["--max-budget-usd", str(args.max_budget_usd)]
+        return command
 
-    plan_prompt = f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}{build_lineage_block(lineage)}"""
-    started = time.monotonic()
-    usage = invoke(
-        "Claude: plan",
-        claude_base,
-        plan_prompt,
-        plan,
-        repo,
-        args.dry_run,
-        timeout=args.stage_timeout_seconds,
-        parse_json=True,
+    def analysis_command(
+        backend: str, model: str | None, output: Path
+    ) -> tuple[list[str], bool]:
+        if backend == "claude":
+            return claude_command(model), True
+        command = [
+            "codex", "exec", "-C", str(repo), "--sandbox", "read-only",
+            "--color", "never", "--output-last-message", str(output), "-",
+        ]
+        if self_evolve:
+            command[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
+        if model:
+            command[2:2] = ["--model", model]
+        return command, False
+
+    plan_cmd, plan_parse_json = analysis_command(plan_backend, stage_models["plan"], plan)
+    review_cmd, review_parse_json = analysis_command(
+        review_backend, stage_models["review"], review
     )
-    record_stage("Claude: plan", usage, time.monotonic() - started)
 
     codex_cmd = [
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
         "--color", "never", "--output-last-message", str(codex_result), "-",
     ]
-    if args.codex_model:
-        codex_cmd[2:2] = ["--model", args.codex_model]
+    if self_evolve:
+        codex_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
+    if stage_models["implement"]:
+        codex_cmd[2:2] = ["--model", stage_models["implement"]]
+
+    fix_cmd = [
+        "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
+        "--color", "never", "--output-last-message", str(fix_result), "-",
+    ]
+    if self_evolve:
+        fix_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
+    if stage_models["fix"]:
+        fix_cmd[2:2] = ["--model", stage_models["fix"]]
+
+    plan_prompt = f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}{build_lineage_block(lineage)}"""
+    started = time.monotonic()
+    usage = invoke(
+        f"{plan_backend.title()}: plan",
+        plan_cmd,
+        plan_prompt,
+        plan,
+        repo,
+        args.dry_run,
+        timeout=args.stage_timeout_seconds,
+        parse_json=plan_parse_json,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
+    )
+    record_stage(f"{plan_backend.title()}: plan", usage, time.monotonic() - started)
+
     started = time.monotonic()
     usage = invoke(
         "Codex: implement",
@@ -588,25 +892,29 @@ def main() -> int:
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
     )
     record_stage("Codex: implement", usage, time.monotonic() - started)
 
     started = time.monotonic()
     usage = invoke(
-        "Claude: review",
-        claude_base,
+        f"{review_backend.title()}: review",
+        review_cmd,
         f"""Act as a strict code reviewer. Review all working-tree changes relative to baseline commit {baseline} for the task below. Use git status, git diff, and inspect every relevant untracked file as well as tracked changes. Do not edit anything. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{args.task}""",
         review,
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
-        parse_json=True,
+        parse_json=review_parse_json,
+        env=agent_env,
+        protected_head=baseline if self_evolve and not args.dry_run else None,
     )
-    record_stage("Claude: review", usage, time.monotonic() - started)
+    record_stage(f"{review_backend.title()}: review", usage, time.monotonic() - started)
 
     reviews = [review]
     if mir_enabled:
-        # The mirror reviewers never see Claude's review or use repository
+        # The mirror reviewers never see the primary review or use repository
         # tools, so every backend receives the diff inside its prompt. Each
         # node reviews the same diff independently of the others.
         diff_text = complete_diff(repo, baseline)
@@ -614,65 +922,141 @@ def main() -> int:
             diff_text = diff_text[:120_000] + "\n[diff truncated for length]"
         metadata["scroll_sha256"] = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
         fingerprint = None if args.dry_run else tree_fingerprint(repo, baseline)
+        mirror_jobs = []
         for node in mir_nodes or [None]:
             skill_text = mir_skill_texts.get(node) if node else None
-            skill_prefix = f"{skill_text}\n\n---\n\n" if skill_text else ""
-            mir_prompt = f"""{skill_prefix}Act as a strict, independent code reviewer. Another reviewer is assessing the same change separately; judge only from what is below. You have no tools this session — the complete working-tree diff is included. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence from the diff, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{args.task}\n\nDIFF (relative to baseline {baseline}):\n{diff_text or "(no changes detected)"}"""
-            node_tag = f", {node}" if node else ""
-            stage_label = f"Mir ({mir_backend}{node_tag}): independent review"
-            mir_review = artifacts / (f"03b-mir-{node}-review.md" if node else "03b-mir-review.md")
+            mir_prompt = build_mir_prompt(args.task, baseline, diff_text, skill_text)
+            stage_label = mir_stage_label(mir_backend, node)
+            mir_review = mir_review_path(artifacts, node)
 
             mir_cmd, prompt_flag, parse_json = mirror_review_invocation(
                 mir_backend,
                 repo=repo,
                 output=mir_review,
                 node=node,
-                hermes_model=args.hermes_model,
-                claude_model=args.claude_model,
-                codex_model=args.codex_model,
+                hermes_model=stage_models["mir"] if mir_backend == "hermes" else None,
+                claude_model=stage_models["mir"] if mir_backend == "claude" else None,
+                codex_model=stage_models["mir"] if mir_backend == "codex" else None,
                 max_budget_usd=args.max_budget_usd,
             )
+            if self_evolve:
+                mir_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
+            mirror_jobs.append((stage_label, mir_review, mir_cmd, prompt_flag, parse_json, mir_prompt))
 
-            started = time.monotonic()
-            usage = invoke(
-                stage_label,
-                mir_cmd,
-                mir_prompt,
-                mir_review,
-                repo,
-                args.dry_run,
-                prompt_flag=prompt_flag,
-                timeout=args.stage_timeout_seconds,
-                parse_json=parse_json,
-            )
-            duration = time.monotonic() - started
-            tainted = False
+        if all_codex or args.parallel_mirs:
+            first_error = None
+            completed_reviews = {}
+            with ThreadPoolExecutor(max_workers=len(mirror_jobs)) as executor:
+                futures = {}
+                for job_index, job in enumerate(mirror_jobs):
+                    stage_label, mir_review, mir_cmd, prompt_flag, parse_json, mir_prompt = job
+                    future = executor.submit(
+                        invoke_timed, stage_label, mir_cmd, mir_prompt, mir_review, repo, args.dry_run,
+                        prompt_flag=prompt_flag, timeout=args.stage_timeout_seconds,
+                        parse_json=parse_json, buffered=True,
+                        env=agent_env,
+                        protected_head=baseline if self_evolve and not args.dry_run else None,
+                    )
+                    futures[future] = (job_index, stage_label, mir_review)
+                for future in as_completed(futures):
+                    job_index, stage_label, mir_review = futures[future]
+                    try:
+                        usage, console_text, duration = future.result()
+                        print(f"\n==> {stage_label}", flush=True)
+                        if console_text:
+                            print(console_text, end="" if console_text.endswith("\n") else "\n")
+                        completed_reviews[job_index] = mir_review
+                    except Exception as error:
+                        usage = None
+                        if isinstance(error, TimedInvocationError):
+                            duration = error.duration
+                            stage_error = error.error
+                        else:
+                            # Defensive fallback for failures outside invoke_timed.
+                            duration = 0.0
+                            stage_error = error
+                        print(
+                            f"\n==> {stage_label}\nERROR: {stage_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        if first_error is None:
+                            first_error = stage_error
+                    record_stage(stage_label, usage, duration)
+
             if fingerprint is not None:
                 after = tree_fingerprint(repo, baseline)
-                if after == fingerprint:
-                    metadata["vows"][stage_label] = "kept"
-                else:
-                    # Re-baseline so later nodes aren't blamed for this breach.
-                    metadata["vows"][stage_label] = "broken"
-                    fingerprint = after
+                verdict = collective_vow_verdict(fingerprint, after)
+                # A corridor breach belongs to this corridor, not synthesis.
+                fingerprint = after
+                for stage_label, *_ in mirror_jobs:
+                    metadata["vows"][stage_label] = verdict
+                write(run_metadata, json.dumps(metadata, indent=2))
+                if verdict == "broken":
                     print(
-                        f"warning: vow of stillness broken — the working tree changed during {stage_label}",
+                        "warning: collective vow of stillness broken — the working tree "
+                        "changed during the parallel mirror corridor",
                         file=sys.stderr,
                     )
-                    if args.vow_policy == "abort":
-                        record_stage(stage_label, usage, duration)
-                        raise RuntimeError(
-                            f"vow of stillness broken during {stage_label} (--vow-policy abort)"
+                    if args.vow_policy == "abort" and first_error is None:
+                        first_error = RuntimeError(
+                            "collective vow of stillness broken during parallel mirror corridor "
+                            "(--vow-policy abort)"
                         )
                     if args.vow_policy == "taint":
-                        tainted = True
+                        completed_reviews = {}
                         print(
-                            f"warning: {mir_review.name} is tainted and excluded from synthesis and fix",
+                            "warning: all parallel mirror reviews are tainted and excluded "
+                            "from synthesis and fix",
                             file=sys.stderr,
                         )
-            record_stage(stage_label, usage, duration)
-            if not tainted:
-                reviews.append(mir_review)
+            if first_error is not None:
+                raise first_error
+            reviews.extend(completed_reviews[index] for index in sorted(completed_reviews))
+        else:
+            for stage_label, mir_review, mir_cmd, prompt_flag, parse_json, mir_prompt in mirror_jobs:
+                started = time.monotonic()
+                usage = invoke(
+                    stage_label,
+                    mir_cmd,
+                    mir_prompt,
+                    mir_review,
+                    repo,
+                    args.dry_run,
+                    prompt_flag=prompt_flag,
+                    timeout=args.stage_timeout_seconds,
+                    parse_json=parse_json,
+                    env=agent_env,
+                    protected_head=baseline if self_evolve and not args.dry_run else None,
+                )
+                duration = time.monotonic() - started
+                tainted = False
+                if fingerprint is not None:
+                    after = tree_fingerprint(repo, baseline)
+                    if after == fingerprint:
+                        metadata["vows"][stage_label] = "kept"
+                    else:
+                        # Re-baseline so later nodes aren't blamed for this breach.
+                        metadata["vows"][stage_label] = "broken"
+                        fingerprint = after
+                        print(
+                            f"warning: vow of stillness broken — the working tree changed during {stage_label}",
+                            file=sys.stderr,
+                        )
+                        if args.vow_policy == "abort":
+                            record_stage(stage_label, usage, duration)
+                            raise RuntimeError(
+                                f"vow of stillness broken during {stage_label} (--vow-policy abort)"
+                            )
+                        if args.vow_policy == "taint":
+                            tainted = True
+                            print(
+                                f"warning: {mir_review.name} is tainted and excluded from synthesis and fix",
+                                file=sys.stderr,
+                            )
+                record_stage(stage_label, usage, duration)
+                if not tainted:
+                    reviews.append(mir_review)
 
     synthesis = artifacts / "03c-synthesis.md"
     synth_tainted = False
@@ -685,18 +1069,20 @@ def main() -> int:
             else [(p.name, p.read_text(encoding="utf-8")) for p in reviews if p.is_file()]
         )
         synth_prompt = build_synthesis_prompt(args.task, labeled, synth_skill_text)
-        synth_tag = f", {args.synthesize_node}" if args.synthesize_node else ""
+        synth_tag = f", {synth_node}" if synth_node else ""
         stage_label = f"Synthesis ({synth_backend}{synth_tag}): recombination"
         synth_cmd, prompt_flag, parse_json = mirror_review_invocation(
             synth_backend,
             repo=repo,
             output=synthesis,
-            node=args.synthesize_node,
-            hermes_model=args.hermes_model,
-            claude_model=args.claude_model,
-            codex_model=args.codex_model,
+            node=synth_node,
+            hermes_model=(stage_models["synthesize"] if synth_backend == "hermes" else None),
+            claude_model=(stage_models["synthesize"] if synth_backend == "claude" else None),
+            codex_model=(stage_models["synthesize"] if synth_backend == "codex" else None),
             max_budget_usd=args.max_budget_usd,
         )
+        if self_evolve:
+            synth_cmd[2:2] = ["-c", "sandbox_workspace_write.network_access=false"]
         synth_before = None if args.dry_run else tree_fingerprint(repo, baseline)
         started = time.monotonic()
         usage = invoke(
@@ -709,6 +1095,8 @@ def main() -> int:
             prompt_flag=prompt_flag,
             timeout=args.stage_timeout_seconds,
             parse_json=parse_json,
+            env=agent_env,
+            protected_head=baseline if self_evolve and not args.dry_run else None,
         )
         duration = time.monotonic() - started
         if not args.dry_run:
@@ -769,12 +1157,14 @@ def main() -> int:
             started = time.monotonic()
             usage = invoke(
                 "Codex: address review",
-                codex_cmd[:-2] + [str(fix_result), "-"],
+                fix_cmd,
                 fix_prompt,
                 fix_result,
                 repo,
                 args.dry_run,
                 timeout=args.stage_timeout_seconds,
+                env=agent_env,
+                protected_head=baseline if self_evolve and not args.dry_run else None,
             )
             record_stage("Codex: address review", usage, time.monotonic() - started)
 
