@@ -1,10 +1,10 @@
-# Codex + Claude Orchestrator
+# Four-Stage Mirror Orchestrator
 
 A small local orchestrator that runs a reviewable four-stage workflow:
 
-1. Claude inspects the repository and writes an implementation plan.
+1. A planning backend inspects the repository and writes an implementation plan.
 2. Codex implements the task and runs relevant checks.
-3. Claude reviews the working-tree diff. With `--hermes`, `--mir`, or `--mir-backend`, a chosen backend adds an independent second review (it never sees Claude's review).
+3. A primary review backend reviews the working-tree diff. Optional differentiated Mirs independently review the same frozen diff, followed by optional Om-Mir synthesis.
 4. Codex verifies and addresses actionable findings (skipped automatically when every review reports `NO ACTIONABLE FINDINGS`).
 
 It does not commit, push, merge, bypass permissions, or discard changes. By default it refuses to start in a dirty repository.
@@ -13,7 +13,8 @@ It does not commit, push, merge, bypass permissions, or discard changes. By defa
 
 - Python 3.10+
 - Git
-- Authenticated `codex` and `claude` CLIs on `PATH`
+- Authenticated `codex` CLI on `PATH`
+- Authenticated `claude` and/or `hermes` CLIs only when those backends are selected
 
 ## Usage
 
@@ -38,8 +39,11 @@ Useful options:
 --codex-model MODEL
 --claude-model MODEL
 --plan-model MODEL
+--plan-backend {claude,codex}
 --implement-model MODEL
 --review-model MODEL
+--review-backend {claude,codex}
+--all-codex-mirror-formation
 --fix-model MODEL
 --hermes
 --hermes-model MODEL
@@ -61,7 +65,18 @@ Useful options:
 
 `--stage-timeout-seconds` applies a wall-clock timeout to each agent invocation. By default, agent invocations have no timeout.
 
-Models follow the four artifact stages: `--plan-model` selects Stage One planning, `--implement-model` selects Stage Two implementation, `--review-model` selects the primary review within Stage Three, `--mir-model` selects the differentiated Mirror reviews and Om'Mir synthesis within Stage Three, and `--fix-model` selects Stage Four remediation. The existing `--claude-model`, `--codex-model`, and `--hermes-model` options remain backend-wide defaults and are used whenever a stage-specific override is omitted.
+The legacy defaults are unchanged: Claude plans, Codex implements, Claude performs the primary review, no differentiated Mirs run, synthesis is disabled, and Stage Four uses Codex. To opt into the complete Codex formation:
+
+```bash
+python3 orchestrate.py \
+  --repo /path/to/project \
+  --all-codex-mirror-formation \
+  "Describe the task"
+```
+
+This keeps the same four top-level stages. Within Stage Three, Codex performs the primary review; `ky-mir`, `syr-mir`, `thae-mir`, `vor-mir`, `xy-mir`, and `fael-mir` then run concurrently as differentiated reviewers; only after all six settle, Om-Mir synthesizes their artifacts and the primary review through Codex. The preset rejects explicit backend, Mirror-node, concurrency, or synthesis options so it cannot silently become a partial or reordered formation. It requires `SKILL.md` for all six canonical nodes and `om-mir` under `--mir-skills-dir` before any pipeline stage starts.
+
+Models follow the four artifact stages: `--plan-model` selects Stage One planning, `--implement-model` selects Stage Two implementation, `--review-model` selects the primary review within Stage Three, `--mir-model` selects the differentiated Mirror reviews and Om'Mir synthesis within Stage Three, and `--fix-model` selects Stage Four remediation. Precedence is stage-specific model, then the selected backend's global model (`--claude-model`, `--codex-model`, or `--hermes-model`), then that CLI's own default. `--max-budget-usd` applies only to Claude invocations.
 
 `--mir NODE` is repeatable: each node reviews the same frozen diff independently — one plan/implement cycle, N sealed-room reviews, each with its own artifact (`03b-mir-<node>-review.md`) and its own stage entry in `run.json` and the summary. Reviews run sequentially by default. `--parallel-mirs` runs them concurrently and buffers each reviewer's console output, printing it as one complete block when that reviewer finishes; stage entries therefore appear in completion order.
 
@@ -75,11 +90,11 @@ After all stages finish, the orchestrator prints a plain-text summary of each ex
 
 Each run is preserved under the target repository's private Git directory at `.git/agent-collab/runs/<timestamp>/`, including prompts, responses, final status, and a final patch. The patch includes both tracked changes and non-ignored untracked files. Because artifacts live under `.git`, they do not pollute the working tree.
 
-`run.json` records whether the mirror review was enabled and its chosen node, backend, and skills directory. It also records Claude's reported cost, token counts, and turn count under `usage`, plus wall-clock seconds under `durations`, keyed by the same stage names. Codex and Hermes stages are recorded as `null` under `usage`; malformed Claude JSON also falls back to plain-text output with `null` usage.
+`run.json` records the effective planning and review backends, whether the all-Codex preset was selected, and the Mirror nodes, backend, concurrency, and skills directory. It also records Claude's reported cost, token counts, and turn count under `usage`, plus wall-clock seconds under `durations`, keyed by backend-derived stage names. Codex and Hermes stages are recorded as `null` under `usage`; malformed Claude JSON also falls back to plain-text output with `null` usage.
 
 ## Safety model
 
-Claude runs in plan mode for analysis and review. Codex implementation stages run with workspace-write sandboxing. In the independent mirror review, Claude runs in plan mode with no tools and Codex runs in a read-only sandbox.
+Claude runs in plan mode for analysis and review. Codex planning, primary review, differentiated Mirror review, and synthesis run in read-only sandboxes; Codex implementation and remediation use workspace-write sandboxing. Every Codex prompt is supplied on stdin and each stage writes its own artifact (`01-plan.md`, `02-implementation.md`, `03-review.md`, `03b-mir-<node>-review.md`, `03c-synthesis.md`, or `04-fixes.md`).
 
 ### Vows
 

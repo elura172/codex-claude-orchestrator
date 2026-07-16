@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrate import (
+    CANONICAL_MIR_NODES,
     LINEAGE_CAP,
     SYNTHESIS_CAP,
     TimedInvocationError,
@@ -29,6 +31,7 @@ from orchestrate import (
     mir_stage_label,
     mirror_review_enabled,
     mirror_review_invocation,
+    parse_args,
     resolve_mir_skill,
     review_is_clean,
     run,
@@ -36,6 +39,22 @@ from orchestrate import (
     tree_fingerprint,
     unique_mir_nodes,
 )
+
+
+def namespace(**overrides):
+    values = dict(
+        task="test task", repo=Path("."), codex_model=None, claude_model=None,
+        plan_model=None, implement_model=None, review_model=None, fix_model=None,
+        plan_backend="claude", review_backend="claude",
+        all_codex_mirror_formation=False, hermes=False, hermes_model=None,
+        mir_model=None, mir=None, mir_backend=None, parallel_mirs=False,
+        synthesize=False, synthesize_backend=None, synthesize_node=None,
+        lineage=0, vow_policy="taint", mir_skills_dir=Path("skills"),
+        max_budget_usd=None, stage_timeout_seconds=None, allow_dirty=False,
+        skip_review_fix=False, dry_run=True,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
 
 
 class SynthesisPromptTests(unittest.TestCase):
@@ -389,11 +408,132 @@ class InvokeTests(unittest.TestCase):
 
 
 class MirrorPureLogicTests(unittest.TestCase):
+    def test_cli_defaults_preserve_legacy_pipeline(self) -> None:
+        with patch.object(sys, "argv", ["orchestrate.py", "task"]):
+            args = parse_args()
+
+        self.assertEqual(args.plan_backend, "claude")
+        self.assertEqual(args.review_backend, "claude")
+        self.assertFalse(args.all_codex_mirror_formation)
+        self.assertIsNone(args.mir)
+        self.assertFalse(args.parallel_mirs)
+        self.assertFalse(args.synthesize)
+
+    def test_all_codex_preset_rejects_explicit_formation_options(self) -> None:
+        for option in ("--plan-backend", "--mir", "--parallel-mirs", "--synthesize"):
+            value = ["codex"] if option == "--plan-backend" else (
+                ["ky-mir"] if option == "--mir" else []
+            )
+            with (
+                self.subTest(option=option),
+                patch.object(
+                    sys, "argv",
+                    ["orchestrate.py", "--all-codex-mirror-formation", option, *value, "task"],
+                ),
+                self.assertRaises(SystemExit),
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", io.StringIO()),
+            ):
+                parse_args()
+
+    def test_cli_rejects_abbreviated_backend_options(self) -> None:
+        with (
+            patch.object(sys, "argv", ["orchestrate.py", "--plan-b", "codex", "task"]),
+            self.assertRaises(SystemExit),
+            redirect_stdout(io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            parse_args()
+
+    def test_all_codex_preset_expands_canonical_formation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git_dir = repo / ".git"
+            git_dir.mkdir()
+            skills_dir = repo / "skills"
+            for node in (*CANONICAL_MIR_NODES, "om-mir"):
+                skill = skills_dir / node / "SKILL.md"
+                skill.parent.mkdir(parents=True)
+                skill.write_text(f"{node} lens", encoding="utf-8")
+            args = namespace(
+                repo=repo, mir_skills_dir=skills_dir,
+                all_codex_mirror_formation=True, skip_review_fix=True, dry_run=False,
+            )
+
+            def fake_git(_repo: Path, *git_args: str) -> str:
+                return {
+                    ("rev-parse", "--show-toplevel"): str(repo),
+                    ("rev-parse", "--path-format=absolute", "--git-dir"): str(git_dir),
+                    ("rev-parse", "HEAD"): "baseline",
+                    ("status", "--porcelain"): "",
+                    ("status", "--short"): "",
+                }[git_args]
+
+            invocations = []
+            mirror_barrier = threading.Barrier(len(CANONICAL_MIR_NODES))
+
+            def fake_invoke(*call_args, **kwargs):
+                invocations.append((call_args, kwargs))
+                if call_args[0].startswith("Mir ("):
+                    mirror_barrier.wait(timeout=2)
+                call_args[3].write_text("SEAL: CLEAN\n", encoding="utf-8")
+                return (None, "complete\n") if kwargs.get("buffered") else None
+
+            with (
+                patch("orchestrate.parse_args", return_value=args),
+                patch("orchestrate.shutil.which", return_value="/bin/tool"),
+                patch("orchestrate.git", side_effect=fake_git),
+                patch("orchestrate.complete_diff", return_value="frozen diff"),
+                patch("orchestrate.tree_fingerprint", return_value="still"),
+                patch("orchestrate.invoke", side_effect=fake_invoke),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(), 0)
+
+            artifacts = next((git_dir / "agent-collab" / "runs").iterdir())
+            metadata = json.loads((artifacts / "run.json").read_text())
+            self.assertEqual(metadata["mir_nodes"], list(CANONICAL_MIR_NODES))
+            self.assertNotIn("om-mir", metadata["mir_nodes"])
+            self.assertTrue(metadata["parallel_mirs"])
+            self.assertEqual(metadata["plan_backend"], "codex")
+            self.assertEqual(metadata["review_backend"], "codex")
+            self.assertEqual(metadata["mir_backend"], "codex")
+            self.assertEqual(metadata["synthesize_backend"], "codex")
+            self.assertEqual(metadata["synthesize_node"], "om-mir")
+            self.assertEqual(
+                metadata["synthesis_inputs"],
+                ["03-review.md", *[
+                    f"03b-mir-{node}-review.md" for node in CANONICAL_MIR_NODES
+                ]],
+            )
+            for filename in metadata["synthesis_inputs"][1:]:
+                self.assertTrue((artifacts / filename).is_file())
+            calls_by_stage = {call_args[0]: (call_args, kwargs) for call_args, kwargs in invocations}
+            for stage in ("Codex: plan", "Codex: review"):
+                call_args, kwargs = calls_by_stage[stage]
+                command = call_args[1]
+                self.assertEqual(command[-1], "-")
+                self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+                self.assertFalse(kwargs["parse_json"])
+            implement_command = calls_by_stage["Codex: implement"][0][1]
+            self.assertEqual(
+                implement_command[implement_command.index("--sandbox") + 1],
+                "workspace-write",
+            )
+            stages = [call_args[0] for call_args, _ in invocations]
+            synthesis_index = stages.index("Synthesis (codex, om-mir): recombination")
+            self.assertTrue(all(
+                stages.index(mir_stage_label("codex", node)) < synthesis_index
+                for node in CANONICAL_MIR_NODES
+            ))
+
     def test_stage_models_use_backend_defaults_and_independent_overrides(self) -> None:
         defaults = select_stage_models(
             claude_model="claude-default",
             codex_model="codex-default",
             hermes_model="hermes-default",
+            plan_backend="claude",
+            review_backend="claude",
             mir_backend="hermes",
             synth_backend="codex",
         )
@@ -410,6 +550,8 @@ class MirrorPureLogicTests(unittest.TestCase):
             claude_model="claude-default",
             codex_model="codex-default",
             hermes_model="hermes-default",
+            plan_backend="codex",
+            review_backend="codex",
             mir_backend="claude",
             synth_backend="hermes",
             plan_model="plan-specific",

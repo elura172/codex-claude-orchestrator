@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, auditable Codex + Claude collaboration orchestrator."""
+"""Small, auditable multi-agent collaboration orchestrator."""
 
 from __future__ import annotations
 
@@ -22,6 +22,16 @@ import time
 
 class StageTimeoutError(RuntimeError):
     pass
+
+
+CANONICAL_MIR_NODES = (
+    "ky-mir",
+    "syr-mir",
+    "thae-mir",
+    "vor-mir",
+    "xy-mir",
+    "fael-mir",
+)
 
 
 class TimedInvocationError(Exception):
@@ -395,6 +405,8 @@ def select_stage_models(
     claude_model: str | None,
     codex_model: str | None,
     hermes_model: str | None,
+    plan_backend: str,
+    review_backend: str,
     mir_backend: str,
     synth_backend: str,
     plan_model: str | None = None,
@@ -410,9 +422,9 @@ def select_stage_models(
         "hermes": hermes_model,
     }
     return {
-        "plan": plan_model or claude_model,
+        "plan": plan_model or backend_defaults[plan_backend],
         "implement": implement_model or codex_model,
-        "review": review_model or claude_model,
+        "review": review_model or backend_defaults[review_backend],
         "mir": mir_model or backend_defaults[mir_backend],
         # Om'Mir is the synthesis node within the mirror formation. An
         # explicit mirror model therefore governs synthesis too; otherwise
@@ -489,16 +501,35 @@ def invoke(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Have Claude plan/review and Codex implement/fix a task in a Git repository."
+        description="Run a reviewable four-stage agent pipeline in a Git repository.",
+        allow_abbrev=False,
     )
     parser.add_argument("task", help="The concrete engineering task to complete")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Target Git repository")
     parser.add_argument("--codex-model", help="Optional Codex model override")
     parser.add_argument("--claude-model", help="Optional Claude model override")
-    parser.add_argument("--plan-model", help="Model override for the Claude planning stage")
+    parser.add_argument("--plan-model", help="Model override for the planning stage")
     parser.add_argument("--implement-model", help="Model override for the Codex implementation stage")
-    parser.add_argument("--review-model", help="Model override for the primary Claude review stage")
+    parser.add_argument("--review-model", help="Model override for the primary review stage")
     parser.add_argument("--fix-model", help="Model override for the Codex review-fix stage")
+    parser.add_argument(
+        "--plan-backend",
+        choices=["claude", "codex"],
+        default="claude",
+        help="Backend for Stage One planning (default: claude)",
+    )
+    parser.add_argument(
+        "--review-backend",
+        choices=["claude", "codex"],
+        default="claude",
+        help="Backend for the primary Stage Three review (default: claude)",
+    )
+    parser.add_argument(
+        "--all-codex-mirror-formation",
+        action="store_true",
+        help=("Run the complete Codex formation: Codex plan/review, the six canonical "
+              "Mirs concurrently through Codex, and Om-Mir synthesis through Codex"),
+    )
     parser.add_argument("--hermes", action="store_true",
                         help="Add an independent second review from the Hermes agent (tools disabled)")
     parser.add_argument("--hermes-model", help="Optional Hermes model override")
@@ -571,21 +602,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-timeout-seconds", type=float,
                         help="Wall-clock timeout for each agent invocation (default: none)")
     parser.add_argument("--allow-dirty", action="store_true", help="Run despite existing changes")
-    parser.add_argument("--skip-review-fix", action="store_true", help="Stop after Claude's review")
+    parser.add_argument("--skip-review-fix", action="store_true", help="Stop after Stage Three review")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and prompts only")
     args = parser.parse_args()
     if args.stage_timeout_seconds is not None and (
         not math.isfinite(args.stage_timeout_seconds) or args.stage_timeout_seconds <= 0
     ):
         parser.error("--stage-timeout-seconds must be greater than zero")
+    if args.all_codex_mirror_formation:
+        conflicting = {
+            "--plan-backend", "--review-backend", "--mir", "--mir-backend",
+            "--parallel-mirs", "--synthesize", "--synthesize-backend",
+            "--synthesize-node", "--hermes",
+        }
+        supplied_options = {token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")}
+        supplied = sorted(conflicting & supplied_options)
+        if supplied:
+            parser.error(
+                "--all-codex-mirror-formation cannot be combined with: "
+                + ", ".join(supplied)
+            )
     return args
 
 
 def main() -> int:
     args = parse_args()
-    mir_backend = args.mir_backend or "hermes"
-    mir_nodes = unique_mir_nodes(args.mir or [])
-    mir_enabled = mirror_review_enabled(args.hermes, mir_nodes, args.mir_backend)
+    all_codex = getattr(args, "all_codex_mirror_formation", False)
+    plan_backend = "codex" if all_codex else getattr(args, "plan_backend", "claude")
+    review_backend = "codex" if all_codex else getattr(args, "review_backend", "claude")
+    configured_mir_backend = "codex" if all_codex else args.mir_backend
+    mir_backend = configured_mir_backend or "hermes"
+    mir_nodes = unique_mir_nodes(
+        list(CANONICAL_MIR_NODES) if all_codex else (args.mir or [])
+    )
+    mir_enabled = all_codex or mirror_review_enabled(
+        args.hermes, mir_nodes, configured_mir_backend
+    )
     mir_skills_dir = args.mir_skills_dir.expanduser().resolve()
     mir_skill_texts: dict[str, str | None] = {}
     for node in mir_nodes:
@@ -594,16 +646,18 @@ def main() -> int:
             skill_file.read_text(encoding="utf-8") if mir_backend != "hermes" else None
         )
 
-    synth_enabled = (
+    synth_enabled = all_codex or (
         args.synthesize
         or args.synthesize_backend is not None
         or args.synthesize_node is not None
     )
-    synth_backend = args.synthesize_backend or "claude"
+    synth_backend = "codex" if all_codex else (args.synthesize_backend or "claude")
     stage_models = select_stage_models(
         claude_model=args.claude_model,
         codex_model=args.codex_model,
         hermes_model=args.hermes_model,
+        plan_backend=plan_backend,
+        review_backend=review_backend,
         mir_backend=mir_backend,
         synth_backend=synth_backend,
         plan_model=getattr(args, "plan_model", None),
@@ -613,15 +667,23 @@ def main() -> int:
         fix_model=getattr(args, "fix_model", None),
     )
     synth_skill_text = None
-    synth_node = (args.synthesize_node or "om-mir") if synth_enabled else None
+    synth_node = "om-mir" if all_codex else (
+        (args.synthesize_node or "om-mir") if synth_enabled else None
+    )
     if synth_node:
         synth_skill_file = resolve_mir_skill(mir_skills_dir, synth_node)
         if synth_backend != "hermes":
             synth_skill_text = synth_skill_file.read_text(encoding="utf-8")
 
-    executables = ["git", "codex", "claude"]
+    executables = {"git", "codex"}
+    executables.add(plan_backend)
+    executables.add(review_backend)
+    if mir_enabled:
+        executables.add(mir_backend)
+    if synth_enabled:
+        executables.add(synth_backend)
     if (mir_enabled and mir_backend == "hermes") or (synth_enabled and synth_backend == "hermes"):
-        executables.append("hermes")
+        executables.add("hermes")
         print(
             "warning: hermes >=0.18.2 ignores `-t \"\"` (and --skills force-enables its "
             "declared toolsets), so hermes mirror reviewers run with FULL tool access — "
@@ -630,7 +692,7 @@ def main() -> int:
             "Use --mir-backend claude or codex for an actually-sandboxed review until fixed.",
             file=sys.stderr,
         )
-    for executable in executables:
+    for executable in sorted(executables):
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable not found: {executable}")
     repo = args.repo.expanduser().resolve()
@@ -665,11 +727,14 @@ def main() -> int:
         "task": args.task,
         "repo": str(repo),
         "baseline": baseline,
+        "all_codex_mirror_formation": all_codex,
+        "plan_backend": plan_backend,
+        "review_backend": review_backend,
         "hermes": args.hermes,
         "mir_enabled": mir_enabled,
         "mir_nodes": mir_nodes,
         "mir_backend": mir_backend if mir_enabled else None,
-        "parallel_mirs": args.parallel_mirs,
+        "parallel_mirs": all_codex or args.parallel_mirs,
         "synthesize": synth_enabled,
         "synthesize_backend": synth_backend if synth_enabled else None,
         "synthesize_node": synth_node,
@@ -706,8 +771,23 @@ def main() -> int:
             command += ["--max-budget-usd", str(args.max_budget_usd)]
         return command
 
-    plan_cmd = claude_command(stage_models["plan"])
-    review_cmd = claude_command(stage_models["review"])
+    def analysis_command(
+        backend: str, model: str | None, output: Path
+    ) -> tuple[list[str], bool]:
+        if backend == "claude":
+            return claude_command(model), True
+        command = [
+            "codex", "exec", "-C", str(repo), "--sandbox", "read-only",
+            "--color", "never", "--output-last-message", str(output), "-",
+        ]
+        if model:
+            command[2:2] = ["--model", model]
+        return command, False
+
+    plan_cmd, plan_parse_json = analysis_command(plan_backend, stage_models["plan"], plan)
+    review_cmd, review_parse_json = analysis_command(
+        review_backend, stage_models["review"], review
+    )
 
     codex_cmd = [
         "codex", "exec", "-C", str(repo), "--sandbox", "workspace-write",
@@ -726,16 +806,16 @@ def main() -> int:
     plan_prompt = f"""You are the planning engineer. Analyze this repository and produce a concise, implementation-ready plan for the task below. Do not edit files. Include affected files, important constraints, tests, and risks.\n\nTASK:\n{args.task}{build_lineage_block(lineage)}"""
     started = time.monotonic()
     usage = invoke(
-        "Claude: plan",
+        f"{plan_backend.title()}: plan",
         plan_cmd,
         plan_prompt,
         plan,
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
-        parse_json=True,
+        parse_json=plan_parse_json,
     )
-    record_stage("Claude: plan", usage, time.monotonic() - started)
+    record_stage(f"{plan_backend.title()}: plan", usage, time.monotonic() - started)
 
     started = time.monotonic()
     usage = invoke(
@@ -751,20 +831,20 @@ def main() -> int:
 
     started = time.monotonic()
     usage = invoke(
-        "Claude: review",
+        f"{review_backend.title()}: review",
         review_cmd,
         f"""Act as a strict code reviewer. Review all working-tree changes relative to baseline commit {baseline} for the task below. Use git status, git diff, and inspect every relevant untracked file as well as tracked changes. Do not edit anything. Report only actionable correctness, security, regression, or missing-test findings. For every finding give severity, file/location, evidence, and a concrete fix. Your final line must be exactly SEAL: CLEAN if there are no findings, or SEAL: FINDINGS <n> where n counts them.\n\nTASK:\n{args.task}""",
         review,
         repo,
         args.dry_run,
         timeout=args.stage_timeout_seconds,
-        parse_json=True,
+        parse_json=review_parse_json,
     )
-    record_stage("Claude: review", usage, time.monotonic() - started)
+    record_stage(f"{review_backend.title()}: review", usage, time.monotonic() - started)
 
     reviews = [review]
     if mir_enabled:
-        # The mirror reviewers never see Claude's review or use repository
+        # The mirror reviewers never see the primary review or use repository
         # tools, so every backend receives the diff inside its prompt. Each
         # node reviews the same diff independently of the others.
         diff_text = complete_diff(repo, baseline)
@@ -791,7 +871,7 @@ def main() -> int:
             )
             mirror_jobs.append((stage_label, mir_review, mir_cmd, prompt_flag, parse_json, mir_prompt))
 
-        if args.parallel_mirs:
+        if all_codex or args.parallel_mirs:
             first_error = None
             completed_reviews = {}
             with ThreadPoolExecutor(max_workers=len(mirror_jobs)) as executor:
