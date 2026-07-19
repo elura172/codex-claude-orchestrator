@@ -47,7 +47,7 @@ def namespace(**overrides):
         task="test task", repo=Path("."), codex_model=None, claude_model=None,
         plan_model=None, implement_model=None, review_model=None, fix_model=None,
         plan_backend="claude", review_backend="claude",
-        all_codex_mirror_formation=False, self_evolve=False,
+        all_codex_mirror_formation=False, balanced_claude_codex=False, self_evolve=False,
         hermes=False, hermes_model=None,
         mir_model=None, mir=None, mir_backend=None, parallel_mirs=False,
         synthesize=False, synthesize_backend=None, synthesize_node=None,
@@ -135,6 +135,16 @@ class StillnessTests(unittest.TestCase):
 
             self.assertNotEqual(before, during)
             self.assertEqual(before, after)
+
+    def test_fingerprint_detects_an_empty_commit(self) -> None:
+        from orchestrate import git
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory); git(repo, "init", "-q")
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "seed")
+            baseline = git(repo, "rev-parse", "HEAD"); before = tree_fingerprint(repo, baseline)
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "breach")
+            self.assertNotEqual(before, tree_fingerprint(repo, baseline))
 
 
 class LineageTests(unittest.TestCase):
@@ -260,6 +270,8 @@ class SummaryTests(unittest.TestCase):
                 patch("orchestrate.parse_args", return_value=args),
                 patch("orchestrate.shutil.which", return_value="/bin/tool"),
                 patch("orchestrate.git", side_effect=fake_git),
+                patch("orchestrate.complete_diff", return_value="frozen diff"),
+                patch("orchestrate.tree_fingerprint", return_value="still"),
                 patch("orchestrate.invoke", side_effect=usages),
                 patch("orchestrate.time.monotonic", side_effect=range(0, 16, 2)),
                 redirect_stdout(output),
@@ -431,6 +443,7 @@ class MirrorPureLogicTests(unittest.TestCase):
         self.assertEqual(args.plan_backend, "claude")
         self.assertEqual(args.review_backend, "claude")
         self.assertFalse(args.all_codex_mirror_formation)
+        self.assertFalse(args.balanced_claude_codex)
         self.assertIsNone(args.mir)
         self.assertFalse(args.parallel_mirs)
         self.assertFalse(args.synthesize)
@@ -451,6 +464,57 @@ class MirrorPureLogicTests(unittest.TestCase):
                 patch("sys.stderr", io.StringIO()),
             ):
                 parse_args()
+
+    def test_balanced_preset_rejects_explicit_formation_options(self) -> None:
+        for option, value in (("--review-backend", ["codex"]), ("--mir-backend", ["claude"]),
+                              ("--synthesize", []), ("--all-codex-mirror-formation", [])):
+            with (
+                self.subTest(option=option),
+                patch.object(sys, "argv", ["orchestrate.py", "--balanced-claude-codex", option, *value, "task"]),
+                self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), patch("sys.stderr", io.StringIO()),
+            ):
+                parse_args()
+
+    def test_balanced_preset_uses_one_frozen_scroll_and_even_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory); git_dir = repo / ".git"; git_dir.mkdir()
+            skills_dir = repo / "skills"; skill = skills_dir / "om-mir" / "SKILL.md"
+            skill.parent.mkdir(parents=True); skill.write_text("om lens", encoding="utf-8")
+            args = namespace(repo=repo, mir_skills_dir=skills_dir, balanced_claude_codex=True, dry_run=False)
+
+            def fake_git(_repo: Path, *git_args: str) -> str:
+                return {("rev-parse", "--show-toplevel"): str(repo),
+                        ("rev-parse", "--path-format=absolute", "--git-dir"): str(git_dir),
+                        ("rev-parse", "HEAD"): "baseline", ("status", "--porcelain"): "",
+                        ("status", "--short"): ""}[git_args]
+
+            invocations = []
+            def fake_invoke(*call_args, **kwargs):
+                invocations.append((call_args, kwargs)); call_args[3].write_text("SEAL: FINDINGS 1\n", encoding="utf-8")
+                return None
+
+            with (patch("orchestrate.parse_args", return_value=args),
+                  patch("orchestrate.shutil.which", return_value="/bin/tool"),
+                  patch("orchestrate.git", side_effect=fake_git),
+                  patch("orchestrate.complete_diff", return_value="one frozen scroll"),
+                  patch("orchestrate.tree_fingerprint", return_value="still"),
+                  patch("orchestrate.invoke", side_effect=fake_invoke), redirect_stdout(io.StringIO())):
+                self.assertEqual(main(), 0)
+
+            artifacts = next((git_dir / "agent-collab" / "runs").iterdir())
+            metadata = json.loads((artifacts / "run.json").read_text())
+            self.assertTrue(metadata["balanced_claude_codex"])
+            self.assertEqual((metadata["plan_backend"], metadata["review_backend"]), ("claude", "claude"))
+            self.assertEqual((metadata["mir_backend"], metadata["synthesize_backend"]), ("codex", "claude"))
+            self.assertEqual(metadata["mir_nodes"], [])
+            calls = {call_args[0]: (call_args, kwargs) for call_args, kwargs in invocations}
+            primary_prompt = calls["Claude: review"][0][2]
+            mirror_prompt = calls[mir_stage_label("codex", None)][0][2]
+            self.assertEqual(primary_prompt, mirror_prompt)
+            self.assertIn("one frozen scroll", primary_prompt)
+            self.assertEqual(calls["Claude: review"][0][1][calls["Claude: review"][0][1].index("--tools") + 1], "")
+            self.assertEqual(metadata["vows"]["Claude: plan"], "kept")
+            self.assertEqual(metadata["vows"]["Claude: review"], "kept")
 
     def test_cli_rejects_abbreviated_backend_options(self) -> None:
         with (
@@ -883,7 +947,9 @@ class MirrorPureLogicTests(unittest.TestCase):
                 patch("orchestrate.shutil.which", return_value="/bin/tool"),
                 patch("orchestrate.git", side_effect=fake_git),
                 patch("orchestrate.complete_diff", return_value="frozen diff"),
-                patch("orchestrate.tree_fingerprint", side_effect=["before", "after", "after", "after"]),
+                patch("orchestrate.tree_fingerprint", side_effect=[
+                    "still", "still", "still", "still", "before", "after", "after", "after",
+                ]),
                 patch("orchestrate.invoke", side_effect=fake_invoke),
                 redirect_stdout(io.StringIO()),
             ):

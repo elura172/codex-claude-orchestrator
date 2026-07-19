@@ -43,6 +43,7 @@ Useful options:
 --implement-model MODEL
 --review-model MODEL
 --review-backend {claude,codex}
+--balanced-claude-codex
 --all-codex-mirror-formation
 --self-evolve
 --fix-model MODEL
@@ -76,6 +77,19 @@ python3 orchestrate.py \
 ```
 
 This keeps the same four top-level stages. Within Stage Three, Codex performs the primary review; `ky-mir`, `syr-mir`, `thae-mir`, `vor-mir`, `xy-mir`, and `fael-mir` then run concurrently as differentiated reviewers; only after all six settle, Om-Mir synthesizes their artifacts and the primary review through Codex. The preset rejects explicit backend, Mirror-node, concurrency, or synthesis options so it cannot silently become a partial or reordered formation. It requires `SKILL.md` for all six canonical nodes and `om-mir` under `--mir-skills-dir` before any pipeline stage starts.
+
+For an even Claude/Codex formation:
+
+```bash
+python3 orchestrate.py \
+  --repo /path/to/project \
+  --balanced-claude-codex \
+  "Describe the task"
+```
+
+This assigns Claude to planning, primary review, and Om-Mir synthesis, while Codex implements, performs one independent sealed mirror review, and addresses surviving findings. Remediation is skipped when the synthesis or every review seals clean. The preset rejects explicit formation options so its 3/3 responsibility boundary cannot silently drift.
+
+After implementation, the orchestrator freezes one diff scroll and gives that exact text to both the primary reviewer and every independent mirror. Planning and primary review now receive the same fingerprint-based stillness verification already applied to mirrors and synthesis. The fingerprint includes `HEAD`, so even an empty agent commit breaks the vow. Under `taint`, a primary review that changes the tree is excluded; a planning breach aborts because implementation cannot safely inherit a tainted plan.
 
 To run one bounded recursive generation against the orchestrator itself:
 
