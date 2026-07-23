@@ -15,6 +15,7 @@ from orchestrate import (
     CANONICAL_MIR_NODES,
     DREAMING_CHAMBERS,
     DREAMING_SCHEMA_VERSION,
+    SELF_DREAMING_RUN_CAP,
     LINEAGE_CAP,
     SYNTHESIS_CAP,
     SELF_EVOLUTION_ACTIVE_ENV,
@@ -216,6 +217,61 @@ class LineageTests(unittest.TestCase):
             self.assertIn("PRIVATE RECOGNITION", block)
             self.assertIn("one finding", block)
             self.assertIn("Fael'Mir", block)
+
+    def test_cross_repository_dreaming_is_capped_provenanced_and_paired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            self_runs = root / "orchestrator" / ".git" / "agent-collab" / "runs"
+            target_run = target / "target-run"
+            target_run.mkdir(parents=True)
+            self_runs.mkdir(parents=True)
+
+            target_payload = {
+                "schema_version": DREAMING_SCHEMA_VERSION,
+                "source_run": "target-run",
+                "tezcatl": {"what_was": "target past", "what_remains": "target remain", "what_awaits": "target next"},
+                "chambers": [{"name": "Xy'Mir", "scribings": [{"source": "summary.txt", "text": "target private boundary"}]}],
+            }
+            (target_run / "05-dreaming.json").write_text(json.dumps(target_payload), encoding="utf-8")
+            for index in range(5):
+                run = self_runs / f"2026010{index + 1}-000000"
+                run.mkdir()
+                payload = {
+                    "schema_version": DREAMING_SCHEMA_VERSION,
+                    "source_run": run.name,
+                    "tezcatl": {"what_was": f"self {index}", "what_remains": "self remain", "what_awaits": "self next"},
+                    "chambers": [{"name": "Xy'Mir", "scribings": [{"source": "summary.txt", "text": f"self boundary {index}"}]}],
+                }
+                (run / "05-dreaming.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            block = build_dreaming_lineage_block(
+                target, [("target-run", "target synthesis")], self_dreaming_dir=self_runs
+            )
+            self.assertIn("source=target-repository", block)
+            self.assertIn("source=codex-claude-orchestrator", block)
+            self.assertIn("self 4", block)
+            self.assertNotIn("self 1", block)
+            self.assertIn("paired target chambers: Xy'Mir", block)
+            self.assertLessEqual(block.count("source=codex-claude-orchestrator"), SELF_DREAMING_RUN_CAP)
+
+    def test_self_dreaming_archive_is_not_double_injected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory)
+            run = archive / "run"
+            run.mkdir()
+            payload = {
+                "schema_version": DREAMING_SCHEMA_VERSION,
+                "source_run": "run",
+                "tezcatl": {"what_was": "past", "what_remains": "remain", "what_awaits": "next"},
+                "chambers": [],
+            }
+            (run / "05-dreaming.json").write_text(json.dumps(payload), encoding="utf-8")
+            block = build_dreaming_lineage_block(
+                archive, [("run", "synthesis")], self_dreaming_dir=archive
+            )
+            self.assertIn("source=target-repository", block)
+            self.assertNotIn("source=codex-claude-orchestrator", block)
 
 
 class DreamingTests(unittest.TestCase):
