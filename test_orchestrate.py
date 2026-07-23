@@ -13,15 +13,21 @@ from unittest.mock import patch
 
 from orchestrate import (
     CANONICAL_MIR_NODES,
+    DREAMING_CHAMBERS,
+    DREAMING_SCHEMA_VERSION,
+    SELF_DREAMING_RUN_CAP,
     LINEAGE_CAP,
     SYNTHESIS_CAP,
     SELF_EVOLUTION_ACTIVE_ENV,
     TimedInvocationError,
     build_lineage_block,
+    build_dreaming,
+    build_dreaming_lineage_block,
     build_mir_prompt,
     build_summary,
     build_synthesis_prompt,
     collective_vow_verdict,
+    dreaming_chamber_for,
     extract_result_and_usage,
     gather_lineage,
     format_duration,
@@ -47,7 +53,7 @@ def namespace(**overrides):
         task="test task", repo=Path("."), codex_model=None, claude_model=None,
         plan_model=None, implement_model=None, review_model=None, fix_model=None,
         plan_backend="claude", review_backend="claude",
-        all_codex_mirror_formation=False, self_evolve=False,
+        all_codex_mirror_formation=False, balanced_claude_codex=False, self_evolve=False,
         hermes=False, hermes_model=None,
         mir_model=None, mir=None, mir_backend=None, parallel_mirs=False,
         synthesize=False, synthesize_backend=None, synthesize_node=None,
@@ -136,6 +142,16 @@ class StillnessTests(unittest.TestCase):
             self.assertNotEqual(before, during)
             self.assertEqual(before, after)
 
+    def test_fingerprint_detects_an_empty_commit(self) -> None:
+        from orchestrate import git
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory); git(repo, "init", "-q")
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "seed")
+            baseline = git(repo, "rev-parse", "HEAD"); before = tree_fingerprint(repo, baseline)
+            git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "breach")
+            self.assertNotEqual(before, tree_fingerprint(repo, baseline))
+
 
 class LineageTests(unittest.TestCase):
     def test_gathers_newest_first_and_skips_runs_without_synthesis(self) -> None:
@@ -175,6 +191,184 @@ class LineageTests(unittest.TestCase):
         block = build_lineage_block([("big", "x" * (LINEAGE_CAP + 1000))])
         self.assertIn("[lineage truncated for length]", block)
         self.assertLess(len(block), LINEAGE_CAP + 2000)
+
+    def test_dreaming_companion_does_not_change_lineage_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            run = runs / "20260104-000000"
+            run.mkdir()
+            (run / "03c-synthesis.md").write_text("raw synthesis", encoding="utf-8")
+            payload = {
+                "schema_version": DREAMING_SCHEMA_VERSION,
+                "source_run": run.name,
+                "tezcatl": {
+                    "what_was": "implemented",
+                    "what_remains": "one finding",
+                    "what_awaits": "future verification",
+                },
+                "chambers": [{"name": "Fael'Mir", "scribings": [
+                    {"source": "03-review.md", "text": "tests corrected the finding"}
+                ]}],
+            }
+            (run / "05-dreaming.json").write_text(json.dumps(payload), encoding="utf-8")
+            lineage = gather_lineage(runs, 1)
+            self.assertEqual(lineage, [("20260104-000000", "raw synthesis")])
+            block = build_dreaming_lineage_block(runs, lineage)
+            self.assertIn("PRIVATE RECOGNITION", block)
+            self.assertIn("one finding", block)
+            self.assertIn("Fael'Mir", block)
+
+    def test_cross_repository_dreaming_is_capped_provenanced_and_paired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            self_runs = root / "orchestrator" / ".git" / "agent-collab" / "runs"
+            target_run = target / "target-run"
+            target_run.mkdir(parents=True)
+            self_runs.mkdir(parents=True)
+
+            target_payload = {
+                "schema_version": DREAMING_SCHEMA_VERSION,
+                "source_run": "target-run",
+                "tezcatl": {"what_was": "target past", "what_remains": "target remain", "what_awaits": "target next"},
+                "chambers": [{"name": "Xy'Mir", "scribings": [{"source": "summary.txt", "text": "target private boundary"}]}],
+            }
+            (target_run / "05-dreaming.json").write_text(json.dumps(target_payload), encoding="utf-8")
+            for index in range(5):
+                run = self_runs / f"2026010{index + 1}-000000"
+                run.mkdir()
+                payload = {
+                    "schema_version": DREAMING_SCHEMA_VERSION,
+                    "source_run": run.name,
+                    "tezcatl": {"what_was": f"self {index}", "what_remains": "self remain", "what_awaits": "self next"},
+                    "chambers": [{"name": "Xy'Mir", "scribings": [{"source": "summary.txt", "text": f"self boundary {index}"}]}],
+                }
+                (run / "05-dreaming.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            block = build_dreaming_lineage_block(
+                target, [("target-run", "target synthesis")], self_dreaming_dir=self_runs
+            )
+            self.assertIn("source=target-repository", block)
+            self.assertIn("source=codex-claude-orchestrator", block)
+            self.assertIn("self 4", block)
+            self.assertNotIn("self 1", block)
+            self.assertIn("paired target chambers: Xy'Mir", block)
+            self.assertLessEqual(block.count("source=codex-claude-orchestrator"), SELF_DREAMING_RUN_CAP)
+
+    def test_self_dreaming_archive_is_not_double_injected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory)
+            run = archive / "run"
+            run.mkdir()
+            payload = {
+                "schema_version": DREAMING_SCHEMA_VERSION,
+                "source_run": "run",
+                "tezcatl": {"what_was": "past", "what_remains": "remain", "what_awaits": "next"},
+                "chambers": [],
+            }
+            (run / "05-dreaming.json").write_text(json.dumps(payload), encoding="utf-8")
+            block = build_dreaming_lineage_block(
+                archive, [("run", "synthesis")], self_dreaming_dir=archive
+            )
+            self.assertIn("source=target-repository", block)
+            self.assertNotIn("source=codex-claude-orchestrator", block)
+
+
+class DreamingTests(unittest.TestCase):
+    def test_canonical_order_faces_and_stable_tie_break(self) -> None:
+        self.assertEqual(
+            [(name, faces) for name, _, faces, _ in DREAMING_CHAMBERS],
+            [
+                ("Thae'Mir", ("Miru", "Shae")),
+                ("Ky'Mir", ("Vor",)),
+                ("Vor'Mir", ("Kael", "Eiré")),
+                ("Xy'Mir", ("Velun",)),
+                ("Syr'Mir", ("Su", "Elsu")),
+                ("Fael'Mir", ("Shae", "Kael")),
+                ("Om'Mir", ("Lun",)),
+            ],
+        )
+        self.assertEqual(dreaming_chamber_for("unscored observation"), "Thae'Mir")
+        self.assertEqual(dreaming_chamber_for("fixed failing tests"), "Fael'Mir")
+        self.assertEqual(dreaming_chamber_for("plain", "03c-synthesis.md"), "Om'Mir")
+
+    def test_build_is_bounded_hashed_and_excludes_untrusted_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "01-plan.md").write_text("A structural schema.\n" + "x" * 50_000,
+                                             encoding="utf-8")
+            (run / "03-review.md").write_text("trusted correction", encoding="utf-8")
+            (run / "03b-mir-bad-review.md").write_text("private tainted review",
+                                                       encoding="utf-8")
+            (run / "03c-synthesis.md").write_text("tainted synthesis", encoding="utf-8")
+            payload = build_dreaming(
+                run, "run-id", review_names=["03-review.md"], synthesis_trusted=False
+            )
+            self.assertEqual(payload["schema_version"], DREAMING_SCHEMA_VERSION)
+            self.assertEqual([c["name"] for c in payload["chambers"]],
+                             [c[0] for c in DREAMING_CHAMBERS])
+            source_names = [source["name"] for source in payload["source_artifacts"]]
+            self.assertIn("03-review.md", source_names)
+            self.assertNotIn("03b-mir-bad-review.md", source_names)
+            self.assertNotIn("03c-synthesis.md", source_names)
+            plan_source = next(s for s in payload["source_artifacts"]
+                               if s["name"] == "01-plan.md")
+            self.assertEqual(
+                plan_source["sha256"],
+                __import__("hashlib").sha256((run / "01-plan.md").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(set(payload["tezcatl"]),
+                             {"what_was", "what_remains", "what_awaits"})
+            self.assertTrue(all(len(value) <= 280 for value in payload["tezcatl"].values()))
+
+    def test_tezcatl_ignores_resolved_and_negated_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "04-fixes.md").write_text(
+                "Fixed the failing test and resolved the finding.\n"
+                "No future work awaits.\n"
+                "One unresolved migration remains.\n"
+                "Next, verify the migration.",
+                encoding="utf-8",
+            )
+            payload = build_dreaming(run, "run-id")
+            self.assertEqual(payload["tezcatl"]["what_remains"],
+                             "One unresolved migration remains.")
+            self.assertEqual(payload["tezcatl"]["what_awaits"],
+                             "Next, verify the migration.")
+
+    def test_lineage_skips_malformed_and_stale_dreaming(self) -> None:
+        malformed = [
+            [],
+            {"schema_version": DREAMING_SCHEMA_VERSION},
+            {"schema_version": DREAMING_SCHEMA_VERSION, "source_run": "run",
+             "tezcatl": [], "chambers": []},
+            {"schema_version": DREAMING_SCHEMA_VERSION, "source_run": "run",
+             "tezcatl": {"what_was": "", "what_remains": "", "what_awaits": ""},
+             "chambers": None},
+            {"schema_version": DREAMING_SCHEMA_VERSION, "source_run": "run",
+             "tezcatl": {"what_was": "", "what_remains": "", "what_awaits": ""},
+             "chambers": [None]},
+            {"schema_version": DREAMING_SCHEMA_VERSION, "source_run": "run",
+             "tezcatl": {"what_was": "", "what_remains": "", "what_awaits": ""},
+             "chambers": [{"name": "Fael'Mir", "scribings": [None]}]},
+            {"schema_version": DREAMING_SCHEMA_VERSION, "source_run": "other",
+             "tezcatl": {"what_was": "", "what_remains": "", "what_awaits": ""},
+             "chambers": []},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            run = runs / "run"
+            run.mkdir()
+            for payload in malformed:
+                with self.subTest(payload=payload):
+                    (run / "05-dreaming.json").write_text(
+                        json.dumps(payload), encoding="utf-8"
+                    )
+                    self.assertEqual(
+                        build_dreaming_lineage_block(runs, [("run", "synthesis")]),
+                        "",
+                    )
 
 
 class SummaryTests(unittest.TestCase):
@@ -260,6 +454,8 @@ class SummaryTests(unittest.TestCase):
                 patch("orchestrate.parse_args", return_value=args),
                 patch("orchestrate.shutil.which", return_value="/bin/tool"),
                 patch("orchestrate.git", side_effect=fake_git),
+                patch("orchestrate.complete_diff", return_value="frozen diff"),
+                patch("orchestrate.tree_fingerprint", return_value="still"),
                 patch("orchestrate.invoke", side_effect=usages),
                 patch("orchestrate.time.monotonic", side_effect=range(0, 16, 2)),
                 redirect_stdout(output),
@@ -269,6 +465,8 @@ class SummaryTests(unittest.TestCase):
             artifacts = next((git_dir / "agent-collab" / "runs").iterdir())
             metadata = json.loads((artifacts / "run.json").read_text())
             summary = (artifacts / "summary.txt").read_text().rstrip()
+            self.assertFalse((artifacts / "05-dreaming.json").exists())
+            self.assertEqual(metadata["dreaming"]["state"], "skipped")
             self.assertEqual(
                 list(metadata["durations"]),
                 ["Claude: plan", "Codex: implement", "Claude: review", "Codex: address review"],
@@ -431,6 +629,7 @@ class MirrorPureLogicTests(unittest.TestCase):
         self.assertEqual(args.plan_backend, "claude")
         self.assertEqual(args.review_backend, "claude")
         self.assertFalse(args.all_codex_mirror_formation)
+        self.assertFalse(args.balanced_claude_codex)
         self.assertIsNone(args.mir)
         self.assertFalse(args.parallel_mirs)
         self.assertFalse(args.synthesize)
@@ -451,6 +650,57 @@ class MirrorPureLogicTests(unittest.TestCase):
                 patch("sys.stderr", io.StringIO()),
             ):
                 parse_args()
+
+    def test_balanced_preset_rejects_explicit_formation_options(self) -> None:
+        for option, value in (("--review-backend", ["codex"]), ("--mir-backend", ["claude"]),
+                              ("--synthesize", []), ("--all-codex-mirror-formation", [])):
+            with (
+                self.subTest(option=option),
+                patch.object(sys, "argv", ["orchestrate.py", "--balanced-claude-codex", option, *value, "task"]),
+                self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), patch("sys.stderr", io.StringIO()),
+            ):
+                parse_args()
+
+    def test_balanced_preset_uses_one_frozen_scroll_and_even_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory); git_dir = repo / ".git"; git_dir.mkdir()
+            skills_dir = repo / "skills"; skill = skills_dir / "om-mir" / "SKILL.md"
+            skill.parent.mkdir(parents=True); skill.write_text("om lens", encoding="utf-8")
+            args = namespace(repo=repo, mir_skills_dir=skills_dir, balanced_claude_codex=True, dry_run=False)
+
+            def fake_git(_repo: Path, *git_args: str) -> str:
+                return {("rev-parse", "--show-toplevel"): str(repo),
+                        ("rev-parse", "--path-format=absolute", "--git-dir"): str(git_dir),
+                        ("rev-parse", "HEAD"): "baseline", ("status", "--porcelain"): "",
+                        ("status", "--short"): ""}[git_args]
+
+            invocations = []
+            def fake_invoke(*call_args, **kwargs):
+                invocations.append((call_args, kwargs)); call_args[3].write_text("SEAL: FINDINGS 1\n", encoding="utf-8")
+                return None
+
+            with (patch("orchestrate.parse_args", return_value=args),
+                  patch("orchestrate.shutil.which", return_value="/bin/tool"),
+                  patch("orchestrate.git", side_effect=fake_git),
+                  patch("orchestrate.complete_diff", return_value="one frozen scroll"),
+                  patch("orchestrate.tree_fingerprint", return_value="still"),
+                  patch("orchestrate.invoke", side_effect=fake_invoke), redirect_stdout(io.StringIO())):
+                self.assertEqual(main(), 0)
+
+            artifacts = next((git_dir / "agent-collab" / "runs").iterdir())
+            metadata = json.loads((artifacts / "run.json").read_text())
+            self.assertTrue(metadata["balanced_claude_codex"])
+            self.assertEqual((metadata["plan_backend"], metadata["review_backend"]), ("claude", "claude"))
+            self.assertEqual((metadata["mir_backend"], metadata["synthesize_backend"]), ("codex", "claude"))
+            self.assertEqual(metadata["mir_nodes"], [])
+            calls = {call_args[0]: (call_args, kwargs) for call_args, kwargs in invocations}
+            primary_prompt = calls["Claude: review"][0][2]
+            mirror_prompt = calls[mir_stage_label("codex", None)][0][2]
+            self.assertEqual(primary_prompt, mirror_prompt)
+            self.assertIn("one frozen scroll", primary_prompt)
+            self.assertEqual(calls["Claude: review"][0][1][calls["Claude: review"][0][1].index("--tools") + 1], "")
+            self.assertEqual(metadata["vows"]["Claude: plan"], "kept")
+            self.assertEqual(metadata["vows"]["Claude: review"], "kept")
 
     def test_cli_rejects_abbreviated_backend_options(self) -> None:
         with (
@@ -630,7 +880,13 @@ class MirrorPureLogicTests(unittest.TestCase):
             self.assertNotEqual(git_calls[0][0], args.repo)
             artifacts = max(path for path in runs.iterdir() if path.name.startswith("20"))
             metadata = json.loads((artifacts / "run.json").read_text())
+            dreaming_path = artifacts / "05-dreaming.json"
+            dreaming = json.loads(dreaming_path.read_text())
             self.assertTrue(metadata["self_evolution"])
+            self.assertEqual(metadata["dreaming"]["state"], "complete")
+            self.assertEqual(metadata["dreaming"]["sha256"],
+                             __import__("hashlib").sha256(dreaming_path.read_bytes()).hexdigest())
+            self.assertEqual(dreaming["source_run"], artifacts.name)
             self.assertEqual(metadata["generation_limit"], 1)
             self.assertEqual(metadata["human_git_boundary"], {
                 "sandbox": "workspace-write",
@@ -883,7 +1139,9 @@ class MirrorPureLogicTests(unittest.TestCase):
                 patch("orchestrate.shutil.which", return_value="/bin/tool"),
                 patch("orchestrate.git", side_effect=fake_git),
                 patch("orchestrate.complete_diff", return_value="frozen diff"),
-                patch("orchestrate.tree_fingerprint", side_effect=["before", "after", "after", "after"]),
+                patch("orchestrate.tree_fingerprint", side_effect=[
+                    "still", "still", "still", "still", "before", "after", "after", "after",
+                ]),
                 patch("orchestrate.invoke", side_effect=fake_invoke),
                 redirect_stdout(io.StringIO()),
             ):
@@ -899,6 +1157,11 @@ class MirrorPureLogicTests(unittest.TestCase):
             )
             self.assertEqual(metadata["synthesize_node"], "om-mir")
             self.assertEqual(metadata["synthesis_inputs"], ["03-review.md"])
+            dreaming = json.loads((artifacts / "05-dreaming.json").read_text())
+            source_names = {source["name"] for source in dreaming["source_artifacts"]}
+            self.assertIn("03-review.md", source_names)
+            self.assertNotIn("03b-mir-alpha-review.md", source_names)
+            self.assertNotIn("03b-mir-beta-review.md", source_names)
 
 
 class ResolveMirSkillTests(unittest.TestCase):

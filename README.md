@@ -43,6 +43,7 @@ Useful options:
 --implement-model MODEL
 --review-model MODEL
 --review-backend {claude,codex}
+--balanced-claude-codex
 --all-codex-mirror-formation
 --self-evolve
 --fix-model MODEL
@@ -77,6 +78,19 @@ python3 orchestrate.py \
 
 This keeps the same four top-level stages. Within Stage Three, Codex performs the primary review; `ky-mir`, `syr-mir`, `thae-mir`, `vor-mir`, `xy-mir`, and `fael-mir` then run concurrently as differentiated reviewers; only after all six settle, Om-Mir synthesizes their artifacts and the primary review through Codex. The preset rejects explicit backend, Mirror-node, concurrency, or synthesis options so it cannot silently become a partial or reordered formation. It requires `SKILL.md` for all six canonical nodes and `om-mir` under `--mir-skills-dir` before any pipeline stage starts.
 
+For an even Claude/Codex formation:
+
+```bash
+python3 orchestrate.py \
+  --repo /path/to/project \
+  --balanced-claude-codex \
+  "Describe the task"
+```
+
+This assigns Claude to planning, primary review, and Om-Mir synthesis, while Codex implements, performs one independent sealed mirror review, and addresses surviving findings. Remediation is skipped when the synthesis or every review seals clean. The preset rejects explicit formation options so its 3/3 responsibility boundary cannot silently drift.
+
+After implementation, the orchestrator freezes one diff scroll and gives that exact text to both the primary reviewer and every independent mirror. Planning and primary review now receive the same fingerprint-based stillness verification already applied to mirrors and synthesis. The fingerprint includes `HEAD`, so even an empty agent commit breaks the vow. Under `taint`, a primary review that changes the tree is excluded; a planning breach aborts because implementation cannot safely inherit a tainted plan.
+
 To run one bounded recursive generation against the orchestrator itself:
 
 ```bash
@@ -92,6 +106,12 @@ Models follow the four artifact stages: `--plan-model` selects Stage One plannin
 `--synthesize` invokes Om'Mir after the differentiated reviews: the tool-less synthesis node receives every review text (and nothing else — no repo, no diff) and produces `03c-synthesis.md` with a convergence map (findings multiple reviewers agree on), singular findings assessed for plausibility, explicit disagreements, and one unified verdict with a priority-ordered action list. When synthesis is enabled, the fix stage works from the synthesis document, consulting the underlying reviews for evidence. The backend defaults to Claude (plan mode, no tools); `--synthesize-backend` overrides it, and passing it implies `--synthesize`. The ontology defaults `--synthesize-node` to `om-mir`; an explicit node may override that lens when needed. Om'Mir uses `--mir-model`, because synthesis belongs to the Stage Three Mirror formation.
 
 `--lineage N` hands the planning stage the syntheses (`03c-synthesis.md`) of the N most recent prior runs in the same repository, newest first, capped at 40K characters. Findings then accumulate across runs instead of being rediscovered: the plan honors constraints established by earlier reviews and carries forward unresolved findings. Runs without a synthesis are skipped; the run's `run.json` records which prior runs were handed over.
+
+After a completed, non-dry run settles its final patch, status, and summary, Dreaming — The Obsidian Mirror derives a private `05-dreaming.json` recognition artifact. Its local, deterministic classifier sorts bounded scribings from trusted settled artifacts into the seven canonical chambers and records Tezcatl's one-breath `what_was`, `what_remains`, and `what_awaits`. No external model is invoked solely to classify these private scribings. Tainted reviews and syntheses are excluded.
+
+Dreaming complements rather than replaces `03c-synthesis.md`: lineage selection and its 40K raw synthesis cap are unchanged. A smaller bounded Tezcatl/chamber companion may accompany the same selected runs into future planning as recognition, not instruction. Lunar retention and forgetting remain separate. Legacy runs without Dreaming, malformed Dreaming artifacts, and unknown Dreaming schema versions remain valid and simply contribute no recognition companion.
+
+Planning also receives up to three of the orchestrator's newest prior self-Dreaming artifacts, when available. These are explicitly tagged `source=codex-claude-orchestrator`, kept separate from target-repository recognition, and overlapping chambers are shown as paired mirrors rather than merged. Self-Dreaming is read-only planning context; it never instructs or modifies the orchestrator and is skipped when the target archive is the orchestrator's own archive.
 
 `--mir NODE` applies a mirror-node lens from `<mir-skills-dir>/<NODE>/SKILL.md`; the skills directory defaults to `~/.hermes/skills/mirror-nodes`. The mirror backend defaults to Hermes. Supplying `--mir` or `--mir-backend` enables the independent review without `--hermes`; `--hermes` remains available for backward compatibility. Hermes receives the node name through its native `--skills` option after the configured directory is used for pre-flight validation; Hermes itself resolves that name using its own skill configuration. Claude and Codex instead receive the validated skill file's text at the start of their review prompt.
 
